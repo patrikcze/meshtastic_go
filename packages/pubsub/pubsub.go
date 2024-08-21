@@ -4,45 +4,35 @@ import (
 	"sync"
 )
 
-type Subscriber chan interface{}
-type Topic string
-
+// PubSub struct manages the subscriptions and publishing of messages.
 type PubSub struct {
-	subscribers map[Topic][]Subscriber
+	subscribers map[string][]chan interface{}
 	mutex       sync.RWMutex
 }
 
+// NewPubSub initializes and returns a new PubSub instance.
 func NewPubSub() *PubSub {
 	return &PubSub{
-		subscribers: make(map[Topic][]Subscriber),
+		subscribers: make(map[string][]chan interface{}),
 	}
 }
 
-func (ps *PubSub) Subscribe(topic Topic) Subscriber {
-	ch := make(Subscriber)
+// Subscribe to a topic. Returns a channel to receive messages on.
+func (ps *PubSub) Subscribe(topic string) <-chan interface{} {
+	ch := make(chan interface{}, 1)
 	ps.mutex.Lock()
 	ps.subscribers[topic] = append(ps.subscribers[topic], ch)
 	ps.mutex.Unlock()
 	return ch
 }
 
-func (ps *PubSub) Unsubscribe(topic Topic, subscriber Subscriber) {
-	ps.mutex.Lock()
-	defer ps.mutex.Unlock()
-	subs := ps.subscribers[topic]
-	for i, sub := range subs {
-		if sub == subscriber {
-			ps.subscribers[topic] = append(subs[:i], subs[i+1:]...)
-			close(sub)
-			break
-		}
-	}
-}
-
-func (ps *PubSub) Publish(topic Topic, msg interface{}) {
+// Publish a message to a topic.
+func (ps *PubSub) Publish(topic string, msg interface{}) {
 	ps.mutex.RLock()
 	defer ps.mutex.RUnlock()
-	for _, subscriber := range ps.subscribers[topic] {
-		subscriber <- msg
+	if subscribers, found := ps.subscribers[topic]; found {
+		for _, ch := range subscribers {
+			ch <- msg
+		}
 	}
 }

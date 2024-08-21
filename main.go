@@ -5,10 +5,10 @@ import (
 	"time" // Adjust this to your pubsub package
 
 	// Adjust this to your pubsub package
-	"github.com/patrikcze/meshtastic_go/packages/pubsub"
 
 	pb "google.golang.org/protobuf/proto" // Adjust this to your protobuf package
 
+	"github.com/patrikcze/meshtastic_go/packages/pubsub"
 	"github.com/tarm/serial"
 )
 
@@ -69,8 +69,10 @@ func main() {
 	}
 	defer si.Close()
 
+	pubSub := pubsub.NewPubSub()
+
 	// Subscribe to messages
-	subscriber := pubsub.Subscribe("meshtastic.receive")
+	subscriber := pubSub.Subscribe("meshtastic.receive")
 
 	// Start listening to received messages
 	go func() {
@@ -90,7 +92,7 @@ func main() {
 		}
 
 		// Publish received data to the subscribers
-		pubsub.Publish("meshtastic.receive", data)
+		pubSub.Publish("meshtastic.receive", data)
 	}
 
 }
