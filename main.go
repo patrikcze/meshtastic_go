@@ -5,7 +5,7 @@ import (
 	"time" // Adjust this to your pubsub package
 
 	// Adjust this to your pubsub package
-	"pubsub"
+	"github.com/patrikcze/meshtastic_go/packages/pubsub"
 
 	pb "google.golang.org/protobuf/proto" // Adjust this to your protobuf package
 
