@@ -9,7 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	mshproto "pkg/mshproto"
+	mshproto "meshtastic_go/pkg/mshproto"
 
 	meshtastic "buf.build/gen/go/meshtastic/protobufs/protocolbuffers/go/meshtastic"
 	"go.bug.st/serial"
@@ -118,6 +118,8 @@ func isLikelyText(data []byte) bool {
 }
 
 func handleMessage(data []byte, dispatcher *EventDispatcher) {
+	log.Printf("Attempting to parse packet: %s", hex.EncodeToString(data))
+
 	if isLikelyText(data) {
 		log.Printf("Received Debug Message: %s", string(data))
 		return
