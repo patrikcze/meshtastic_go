@@ -3,38 +3,22 @@ package main
 import (
 	"bytes"
 	"encoding/hex"
+	"io"
 	"log"
 	"time"
 	"unicode/utf8"
 
+	mshproto "meshtastic_go/pkg/mshproto"
+	"meshtastic_go/pkg/pubsub"
+
 	meshtastic "buf.build/gen/go/meshtastic/protobufs/protocolbuffers/go/meshtastic"
-	"github.com/tarm/serial"
+	"go.bug.st/serial"
 	"google.golang.org/protobuf/proto"
 )
 
-// Constants for the Meshtastic protocol
-const (
-	START1          = 0x94
-	START2          = 0xC3
-	HEADER_LEN      = 4
-	MAX_PACKET_SIZE = 512
-)
-
-// PortNum represents the different port numbers in the Meshtastic protocol.
-type PortNum int32
-
-// Enum values for PortNum.
-const (
-	PortNum_UNKNOWN_PORTNUM  PortNum = 0
-	PortNum_TEXT_MESSAGE_APP PortNum = 1
-	PortNum_POSITION_APP     PortNum = 2
-	PortNum_NODEINFO_APP     PortNum = 3
-	// Add other port numbers as needed...
-)
-
-// SerialInterface represents the serial connection to the Meshtastic device
+// SerialInterface represents the serial connection to the Meshtastic device.
 type SerialInterface struct {
-	port *serial.Port
+	port serial.Port
 }
 
 func (si *SerialInterface) ReadPacket(buffer *bytes.Buffer) ([]byte, error) {
@@ -42,14 +26,12 @@ func (si *SerialInterface) ReadPacket(buffer *bytes.Buffer) ([]byte, error) {
 		buf := make([]byte, 1)
 		n, err := si.port.Read(buf)
 		if err != nil {
-			if err.Error() == "EOF" {
-				// EOF can be ignored, keep reading
+			if err == io.EOF {
 				continue
 			}
 			return nil, err
 		}
 		if n == 0 {
-			// No data was read, likely a timeout, so continue reading
 			continue
 		}
 
@@ -57,14 +39,14 @@ func (si *SerialInterface) ReadPacket(buffer *bytes.Buffer) ([]byte, error) {
 		buffer.WriteByte(buf[0])
 
 		// Check if we have at least the header
-		if buffer.Len() >= HEADER_LEN {
+		if buffer.Len() >= mshproto.HEADER_LEN {
 			packetLen := int(buffer.Bytes()[2])<<8 + int(buffer.Bytes()[3])
-			totalLen := HEADER_LEN + packetLen
+			totalLen := mshproto.HEADER_LEN + packetLen
 
 			// If we have the full packet, return it
 			if buffer.Len() >= totalLen {
-				packet := buffer.Next(totalLen) // Read the complete packet
-				return packet[HEADER_LEN:], nil // Return just the payload, stripping the header
+				packet := buffer.Next(totalLen)          // Read the complete packet
+				return packet[mshproto.HEADER_LEN:], nil // Return just the payload, stripping the header
 			}
 		}
 	}
@@ -72,24 +54,19 @@ func (si *SerialInterface) ReadPacket(buffer *bytes.Buffer) ([]byte, error) {
 
 // NewSerialInterface initializes a new SerialInterface.
 func NewSerialInterface(devPath string, baudRate int) (*SerialInterface, error) {
-	c := &serial.Config{Name: devPath, Baud: baudRate, ReadTimeout: time.Millisecond * 500}
-	s, err := serial.OpenPort(c)
+	mode := &serial.Mode{
+		BaudRate: baudRate,
+	}
+	port, err := serial.Open(devPath, mode)
 	if err != nil {
 		return nil, err
 	}
-
-	// Flush the port and wait to ensure the device is ready
-	s.Flush()
-	time.Sleep(100 * time.Millisecond)
-
-	return &SerialInterface{port: s}, nil
+	return &SerialInterface{port: port}, nil
 }
 
 // Close closes the serial port.
 func (si *SerialInterface) Close() {
 	if si.port != nil {
-		si.port.Flush()
-		time.Sleep(100 * time.Millisecond)
 		si.port.Close()
 	}
 }
@@ -100,7 +77,7 @@ func isLikelyText(data []byte) bool {
 }
 
 // handleMessage handles incoming messages and decodes them based on their characteristics.
-func handleMessage(data []byte) {
+func handleMessage(data []byte, ps *pubsub.PubSub) {
 	if isLikelyText(data) {
 		log.Printf("Received Debug Message: %s", string(data))
 		return
@@ -114,58 +91,41 @@ func handleMessage(data []byte) {
 		return
 	}
 
-	// Check if the packet contains decoded information
-	if packet.GetDecoded() != nil {
-		decoded := packet.GetDecoded()
-		portnum := decoded.GetPortnum()
-
-		// Filter specific Portnums (e.g., TEXT_MESSAGE_APP and POSITION_APP)
-		if portnum == meshtastic.PortNum_PORTNUM_TEXT_MESSAGE_APP || portnum == meshtastic.PortNum_PORTNUM_POSITION_APP {
-			payload := decoded.GetPayload()
-			log.Printf("Received message on Portnum %s with payload: %s", portnum.String(), string(payload))
-
-			// Process payload further as needed
-			processPayload(portnum, payload)
-		} else {
-			log.Printf("Received message on unfiltered Portnum %s", portnum.String())
-		}
-	} else if packet.GetEncrypted() != nil {
-		encryptedPayload := packet.GetEncrypted()
-		log.Printf("Received encrypted payload: %s", hex.EncodeToString(encryptedPayload))
-
-		// Add your decryption logic here if necessary
-		decryptedPayload, err := decryptPayload(encryptedPayload)
-		if err != nil {
-			log.Printf("Failed to decrypt payload: %v", err)
-		} else {
-			log.Printf("Decrypted payload: %s", string(decryptedPayload))
-		}
-	} else {
-		log.Printf("Received unknown packet type")
-	}
+	// Publish the packet to the "meshtastic.receive" topic
+	ps.Publish("meshtastic.receive", &packet)
 }
 
-// processPayload handles the decoded payload based on the Portnum.
-func processPayload(portnum meshtastic.PortNum, payload []byte) {
-	switch portnum {
-	case meshtastic.PortNum_PORTNUM_TEXT_MESSAGE:
-		log.Printf("Text Message Received: %s", string(payload))
-	case meshtastic.PortNum_PORTNUM_POSITION_APP:
-		log.Printf("Position Message Received: %s", string(payload))
-		// You could further parse position-related payloads here
-	default:
-		log.Printf("Unhandled Portnum %s with payload: %s", portnum.String(), string(payload))
-	}
-}
+// onReceive processes received MeshPackets.
+func onReceive(packet *meshtastic.MeshPacket) {
+	timestamp := time.Now().Unix()
+	fromNodeNumber := packet.From
+	toNodeNumber := packet.To
+	messageID := packet.Id
+	portnum := packet.GetDecoded().Portnum
+	text := packet.GetDecoded().String()
+	channel := packet.Channel
+	hopLimit := packet.HopLimit
+	hopStart := packet.HopStart
+	rxTime := packet.RxTime
 
-// decryptPayload is a placeholder function to decrypt the payload.
-// Replace this with actual decryption logic if necessary.
-func decryptPayload(encryptedPayload []byte) ([]byte, error) {
-	// Implement decryption here
-	return encryptedPayload, nil // Placeholder, return decrypted data instead
+	log.Printf("Received packet at %d from %d to %d, message ID: %d, portnum: %s, text: %s, channel: %d, hop limit: %d, hop start: %d, rx time: %d",
+		timestamp, fromNodeNumber, toNodeNumber, messageID, portnum, text, channel, hopLimit, hopStart, rxTime)
 }
 
 func main() {
+	// Initialize PubSub system
+	ps := pubsub.NewPubSub()
+
+	// Subscribe to receive MeshPackets
+	packetChannel := ps.Subscribe("meshtastic.receive")
+	go func() {
+		for packet := range packetChannel {
+			if meshPacket, ok := packet.(*meshtastic.MeshPacket); ok {
+				onReceive(meshPacket)
+			}
+		}
+	}()
+
 	// Set your specific device path here
 	devPath := "/dev/cu.usbmodem1101"
 	baudRate := 115200
@@ -185,7 +145,7 @@ func main() {
 			continue
 		}
 		if packet != nil {
-			handleMessage(packet)
+			handleMessage(packet, ps)
 		}
 	}
 }
