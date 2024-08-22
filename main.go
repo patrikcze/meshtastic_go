@@ -5,18 +5,59 @@ import (
 	"encoding/hex"
 	"io"
 	"log"
+	"sync"
 	"time"
 	"unicode/utf8"
 
-	mshproto "meshtastic_go/pkg/mshproto"
-	"meshtastic_go/pkg/pubsub"
+	mshproto "pkg/mshproto"
 
 	meshtastic "buf.build/gen/go/meshtastic/protobufs/protocolbuffers/go/meshtastic"
 	"go.bug.st/serial"
 	"google.golang.org/protobuf/proto"
 )
 
-// SerialInterface represents the serial connection to the Meshtastic device.
+// Event Types and Handlers
+type EventType string
+
+const (
+	EventMeshPacketReceived EventType = "MeshPacketReceived"
+)
+
+type Event struct {
+	Type EventType
+	Data interface{}
+}
+
+type EventHandler func(event Event)
+
+type EventDispatcher struct {
+	handlers map[EventType][]EventHandler
+	mu       sync.RWMutex
+}
+
+func NewEventDispatcher() *EventDispatcher {
+	return &EventDispatcher{
+		handlers: make(map[EventType][]EventHandler),
+	}
+}
+
+func (d *EventDispatcher) RegisterHandler(eventType EventType, handler EventHandler) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.handlers[eventType] = append(d.handlers[eventType], handler)
+}
+
+func (d *EventDispatcher) Dispatch(event Event) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if handlers, found := d.handlers[event.Type]; found {
+		for _, handler := range handlers {
+			go handler(event)
+		}
+	}
+}
+
+// SerialInterface
 type SerialInterface struct {
 	port serial.Port
 }
@@ -38,21 +79,23 @@ func (si *SerialInterface) ReadPacket(buffer *bytes.Buffer) ([]byte, error) {
 		// Append byte to the buffer
 		buffer.WriteByte(buf[0])
 
-		// Check if we have at least the header
-		if buffer.Len() >= mshproto.HEADER_LEN {
+		// Check for START1 and START2 bytes at the beginning of the buffer
+		if buffer.Len() >= 4 && buffer.Bytes()[0] == mshproto.START1 && buffer.Bytes()[1] == mshproto.START2 {
 			packetLen := int(buffer.Bytes()[2])<<8 + int(buffer.Bytes()[3])
-			totalLen := mshproto.HEADER_LEN + packetLen
+			totalLen := 4 + packetLen // Assuming HEADER_LEN is 4
 
 			// If we have the full packet, return it
 			if buffer.Len() >= totalLen {
-				packet := buffer.Next(totalLen)          // Read the complete packet
-				return packet[mshproto.HEADER_LEN:], nil // Return just the payload, stripping the header
+				packet := buffer.Next(totalLen) // Read the complete packet
+				return packet[4:], nil          // Return just the payload, stripping the header
 			}
+		} else {
+			// If the start bytes are not found, discard the buffer
+			buffer.Reset()
 		}
 	}
 }
 
-// NewSerialInterface initializes a new SerialInterface.
 func NewSerialInterface(devPath string, baudRate int) (*SerialInterface, error) {
 	mode := &serial.Mode{
 		BaudRate: baudRate,
@@ -64,20 +107,17 @@ func NewSerialInterface(devPath string, baudRate int) (*SerialInterface, error) 
 	return &SerialInterface{port: port}, nil
 }
 
-// Close closes the serial port.
 func (si *SerialInterface) Close() {
 	if si.port != nil {
 		si.port.Close()
 	}
 }
 
-// isLikelyText checks if the data is likely to be a UTF-8 encoded text.
 func isLikelyText(data []byte) bool {
 	return utf8.Valid(data)
 }
 
-// handleMessage handles incoming messages and decodes them based on their characteristics.
-func handleMessage(data []byte, ps *pubsub.PubSub) {
+func handleMessage(data []byte, dispatcher *EventDispatcher) {
 	if isLikelyText(data) {
 		log.Printf("Received Debug Message: %s", string(data))
 		return
@@ -91,12 +131,22 @@ func handleMessage(data []byte, ps *pubsub.PubSub) {
 		return
 	}
 
-	// Publish the packet to the "meshtastic.receive" topic
-	ps.Publish("meshtastic.receive", &packet)
+	// Create an event for the received packet
+	event := Event{
+		Type: EventMeshPacketReceived,
+		Data: &packet,
+	}
+
+	// Dispatch the event
+	dispatcher.Dispatch(event)
 }
 
-// onReceive processes received MeshPackets.
-func onReceive(packet *meshtastic.MeshPacket) {
+func handleMeshPacketReceived(event Event) {
+	packet, ok := event.Data.(*meshtastic.MeshPacket)
+	if !ok {
+		return
+	}
+
 	timestamp := time.Now().Unix()
 	fromNodeNumber := packet.From
 	toNodeNumber := packet.To
@@ -113,20 +163,13 @@ func onReceive(packet *meshtastic.MeshPacket) {
 }
 
 func main() {
-	// Initialize PubSub system
-	ps := pubsub.NewPubSub()
+	// Initialize the event dispatcher
+	dispatcher := NewEventDispatcher()
 
-	// Subscribe to receive MeshPackets
-	packetChannel := ps.Subscribe("meshtastic.receive")
-	go func() {
-		for packet := range packetChannel {
-			if meshPacket, ok := packet.(*meshtastic.MeshPacket); ok {
-				onReceive(meshPacket)
-			}
-		}
-	}()
+	// Register event handlers
+	dispatcher.RegisterHandler(EventMeshPacketReceived, handleMeshPacketReceived)
 
-	// Set your specific device path here
+	// Serial interface setup
 	devPath := "/dev/cu.usbmodem1101"
 	baudRate := 115200
 
@@ -145,7 +188,7 @@ func main() {
 			continue
 		}
 		if packet != nil {
-			handleMessage(packet, ps)
+			handleMessage(packet, dispatcher)
 		}
 	}
 }
