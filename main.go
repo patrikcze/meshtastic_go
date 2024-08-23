@@ -5,18 +5,23 @@ import (
 	"encoding/hex"
 	"io"
 	"log"
+	"meshtastic_go/pkg/generated"
 	"sync"
 	"time"
-	"unicode/utf8"
 
-	mshproto "meshtastic_go/pkg/mshproto"
-
-	meshtastic "buf.build/gen/go/meshtastic/protobufs/protocolbuffers/go/meshtastic"
 	"go.bug.st/serial"
 	"google.golang.org/protobuf/proto"
+	// Import the generated protobuf code
 )
 
-// Event Types and Handlers
+// Define constants for START1, START2, HEADER_LEN, and MAX_TO_FROM_RADIO_SIZE
+const (
+	START1                 = 0x94
+	START2                 = 0xC3
+	HEADER_LEN             = 4
+	MAX_TO_FROM_RADIO_SIZE = 512
+)
+
 type EventType string
 
 const (
@@ -57,43 +62,8 @@ func (d *EventDispatcher) Dispatch(event Event) {
 	}
 }
 
-// SerialInterface
 type SerialInterface struct {
 	port serial.Port
-}
-
-func (si *SerialInterface) ReadPacket(buffer *bytes.Buffer) ([]byte, error) {
-	for {
-		buf := make([]byte, 1)
-		n, err := si.port.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				continue
-			}
-			return nil, err
-		}
-		if n == 0 {
-			continue
-		}
-
-		// Append byte to the buffer
-		buffer.WriteByte(buf[0])
-
-		// Check for START1 and START2 bytes at the beginning of the buffer
-		if buffer.Len() >= 4 && buffer.Bytes()[0] == mshproto.START1 && buffer.Bytes()[1] == mshproto.START2 {
-			packetLen := int(buffer.Bytes()[2])<<8 + int(buffer.Bytes()[3])
-			totalLen := 4 + packetLen // Assuming HEADER_LEN is 4
-
-			// If we have the full packet, return it
-			if buffer.Len() >= totalLen {
-				packet := buffer.Next(totalLen) // Read the complete packet
-				return packet[4:], nil          // Return just the payload, stripping the header
-			}
-		} else {
-			// If the start bytes are not found, discard the buffer
-			buffer.Reset()
-		}
-	}
 }
 
 func NewSerialInterface(devPath string, baudRate int) (*SerialInterface, error) {
@@ -113,25 +83,91 @@ func (si *SerialInterface) Close() {
 	}
 }
 
-func isLikelyText(data []byte) bool {
-	return utf8.Valid(data)
+func (si *SerialInterface) ReadPacket(buffer *bytes.Buffer) ([]byte, error) {
+	syncing := true
+
+	for {
+		buf := make([]byte, 1)
+		n, err := si.port.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				continue
+			}
+			return nil, err
+		}
+		if n == 0 {
+			continue
+		}
+
+		// Log each byte read from the serial port
+		log.Printf("Read byte: 0x%02X", buf[0])
+
+		// If we are syncing, we need to find the start of the packet
+		if syncing {
+			if buf[0] == START1 {
+				buffer.Reset()
+				buffer.WriteByte(buf[0])
+				syncing = false
+				log.Println("Found START1 byte, looking for START2...")
+				continue
+			} else {
+				log.Println("Unexpected byte, still looking for START1...")
+				continue
+			}
+		}
+
+		// Append byte to the buffer
+		buffer.WriteByte(buf[0])
+
+		// Once START1 is found, ensure START2 is next
+		if buffer.Len() == 2 {
+			if buffer.Bytes()[1] != START2 {
+				log.Println("START2 byte not found, resynchronizing...")
+				syncing = true
+				buffer.Reset()
+				continue
+			} else {
+				log.Println("START2 byte found, reading packet length...")
+			}
+		}
+
+		// If we have at least the header, read the packet length
+		if buffer.Len() == HEADER_LEN {
+			packetLen := int(buffer.Bytes()[2])<<8 + int(buffer.Bytes()[3])
+			log.Printf("Header detected: packetLen=%d", packetLen)
+
+			if packetLen > MAX_TO_FROM_RADIO_SIZE {
+				log.Printf("Invalid packet length: %d. Discarding packet.", packetLen)
+				syncing = true
+				buffer.Reset()
+				continue
+			}
+
+			totalLen := HEADER_LEN + packetLen
+
+			// If we have the full packet, return it
+			if buffer.Len() >= totalLen {
+				packet := buffer.Next(totalLen) // Read the complete packet
+				log.Printf("Full packet received: %s", hex.EncodeToString(packet))
+
+				return packet[HEADER_LEN:], nil // Return just the payload, stripping the header
+			}
+		}
+	}
 }
 
 func handleMessage(data []byte, dispatcher *EventDispatcher) {
 	log.Printf("Attempting to parse packet: %s", hex.EncodeToString(data))
 
-	if isLikelyText(data) {
-		log.Printf("Received Debug Message: %s", string(data))
-		return
-	}
-
-	log.Printf("Raw Data: %s", hex.EncodeToString(data))
-
-	var packet meshtastic.MeshPacket
+	var packet generated.MeshPacket // Use the generated protobuf struct
 	if err := proto.Unmarshal(data, &packet); err != nil {
 		log.Printf("Failed to parse received data: %v", err)
+		log.Printf("Data: %s", hex.EncodeToString(data))
 		return
 	}
+
+	// Log the parsed packet details for debugging
+	log.Printf("Parsed MeshPacket: From=%d, To=%d, Id=%d, Portnum=%d", packet.From, packet.To, packet.Id, packet.GetDecoded().Portnum)
 
 	// Create an event for the received packet
 	event := Event{
@@ -144,24 +180,43 @@ func handleMessage(data []byte, dispatcher *EventDispatcher) {
 }
 
 func handleMeshPacketReceived(event Event) {
-	packet, ok := event.Data.(*meshtastic.MeshPacket)
+	packet, ok := event.Data.(*generated.MeshPacket)
 	if !ok {
 		return
 	}
 
 	timestamp := time.Now().Unix()
-	fromNodeNumber := packet.From
-	toNodeNumber := packet.To
-	messageID := packet.Id
-	portnum := packet.GetDecoded().Portnum
-	text := packet.GetDecoded().String()
-	channel := packet.Channel
-	hopLimit := packet.HopLimit
-	hopStart := packet.HopStart
-	rxTime := packet.RxTime
+	log.Printf("Received packet at %d from %d to %d, message ID: %d",
+		timestamp, packet.From, packet.To, packet.Id)
 
-	log.Printf("Received packet at %d from %d to %d, message ID: %d, portnum: %s, text: %s, channel: %d, hop limit: %d, hop start: %d, rx time: %d",
-		timestamp, fromNodeNumber, toNodeNumber, messageID, portnum, text, channel, hopLimit, hopStart, rxTime)
+	// Check if the packet contains decoded data
+	decoded := packet.GetDecoded()
+	if decoded != nil {
+		switch decoded.Portnum {
+		case generated.PortNum_TELEMETRY_APP:
+			// Decode telemetry data
+			var telemetry generated.Telemetry
+			if err := proto.Unmarshal(decoded.Payload, &telemetry); err != nil {
+				log.Printf("Failed to parse telemetry data: %v", err)
+			} else {
+				// Print telemetry data in a human-readable format
+				log.Printf("Telemetry received: Battery level: %.2f%%, Voltage: %.2fV, Channel Utilization: %.2f%%, Air Utilization TX: %.2f%%, Uptime: %ds",
+					float64(telemetry.GetDeviceMetrics().GetBatteryLevel()),
+					float64(telemetry.GetDeviceMetrics().GetVoltage()),
+					float64(telemetry.GetDeviceMetrics().GetChannelUtilization()),
+					float64(telemetry.GetDeviceMetrics().GetAirUtilTx()),
+					telemetry.GetDeviceMetrics().GetUptimeSeconds(),
+				)
+			}
+		case generated.PortNum_TEXT_MESSAGE_APP:
+			// Decode and print text message
+			log.Printf("Text message received: %s", string(decoded.Payload))
+		default:
+			log.Printf("Received packet with unhandled portnum: %d", decoded.Portnum)
+		}
+	} else {
+		log.Printf("Received packet with no decoded data.")
+	}
 }
 
 func main() {
@@ -172,7 +227,7 @@ func main() {
 	dispatcher.RegisterHandler(EventMeshPacketReceived, handleMeshPacketReceived)
 
 	// Serial interface setup
-	devPath := "/dev/cu.usbmodem1101"
+	devPath := "/dev/cu.usbmodem1101" // Ensure this path is correct for your device
 	baudRate := 115200
 
 	si, err := NewSerialInterface(devPath, baudRate)
@@ -191,6 +246,8 @@ func main() {
 		}
 		if packet != nil {
 			handleMessage(packet, dispatcher)
+		} else {
+			log.Printf("No packet received.")
 		}
 	}
 }
