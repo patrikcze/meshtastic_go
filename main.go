@@ -2,32 +2,28 @@ package main
 
 import (
 	"bytes"
-	"encoding/hex"
+	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"meshtastic_go/pkg/generated"
 	"sync"
 	"time"
 
 	"go.bug.st/serial"
 	"google.golang.org/protobuf/proto"
-	// Import the generated protobuf code
 )
 
-// Define constants for START1, START2, HEADER_LEN, and MAX_TO_FROM_RADIO_SIZE
 const (
-	START1                 = 0x94
-	START2                 = 0xC3
-	HEADER_LEN             = 4
-	MAX_TO_FROM_RADIO_SIZE = 512
+	START1                  = 0x94
+	START2                  = 0xC3
+	HEADER_LEN              = 4
+	MAX_TO_FROM_RADIO_SIZE  = 512
+	EventMeshPacketReceived = "MeshPacketReceived"
 )
 
 type EventType string
-
-const (
-	EventMeshPacketReceived EventType = "MeshPacketReceived"
-)
-
 type Event struct {
 	Type EventType
 	Data interface{}
@@ -46,6 +42,63 @@ func NewEventDispatcher() *EventDispatcher {
 	}
 }
 
+type StreamConn struct {
+	conn serial.Port
+	mu   sync.Mutex
+}
+
+// Write method for StreamConn, now using writeStreamHeader
+func (sc *StreamConn) Write(in proto.Message) error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	// Marshal the protobuf message to bytes
+	data, err := proto.Marshal(in)
+	if err != nil {
+		return fmt.Errorf("error marshalling proto message: %w", err)
+	}
+
+	// Ensure message is not too large
+	if len(data) > MAX_TO_FROM_RADIO_SIZE {
+		return fmt.Errorf("data length exceeds MTU: %d > %d", len(data), MAX_TO_FROM_RADIO_SIZE)
+	}
+
+	// Use the new writeStreamHeader function to write the message header
+	err = writeStreamHeader(sc.conn, uint16(len(data)))
+	if err != nil {
+		return fmt.Errorf("error writing stream header: %w", err)
+	}
+
+	// Write the actual protobuf message
+	_, err = sc.conn.Write(data)
+	if err != nil {
+		return fmt.Errorf("error writing proto message: %w", err)
+	}
+
+	return nil
+}
+
+func writeStreamHeader(w io.Writer, dataLen uint16) error {
+	header := bytes.NewBuffer(nil)
+	header.WriteByte(START1)
+	header.WriteByte(START2)
+	err := binary.Write(header, binary.BigEndian, dataLen)
+	if err != nil {
+		return fmt.Errorf("writing length to buffer: %w", err)
+	}
+	_, err = w.Write(header.Bytes())
+	return err
+}
+
+// Close closes the underlying serial connection.
+func (sc *StreamConn) Close() error {
+	return sc.conn.Close()
+}
+
+func NewRadioStreamConn(port serial.Port) *StreamConn {
+	return &StreamConn{conn: port}
+}
+
 func (d *EventDispatcher) RegisterHandler(eventType EventType, handler EventHandler) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -62,160 +115,159 @@ func (d *EventDispatcher) Dispatch(event Event) {
 	}
 }
 
-type SerialInterface struct {
-	port serial.Port
+type State struct {
+	nodeInfo       *generated.MyNodeInfo
+	deviceMetadata *generated.DeviceMetadata
+	nodes          []*generated.NodeInfo
+	channels       []*generated.Channel
+	configs        []*generated.Config
+	modules        []*generated.ModuleConfig
 }
 
-func NewSerialInterface(devPath string, baudRate int) (*SerialInterface, error) {
-	mode := &serial.Mode{
-		BaudRate: baudRate,
-	}
-	port, err := serial.Open(devPath, mode)
-	if err != nil {
-		return nil, err
-	}
-	return &SerialInterface{port: port}, nil
+func (s *State) SetNodeInfo(nodeInfo *generated.MyNodeInfo) {
+	s.nodeInfo = nodeInfo
 }
 
-func (si *SerialInterface) Close() {
-	if si.port != nil {
-		si.port.Close()
-	}
+func (s *State) SetDeviceMetadata(deviceMetadata *generated.DeviceMetadata) {
+	s.deviceMetadata = deviceMetadata
 }
 
-func (si *SerialInterface) ReadPacket(buffer *bytes.Buffer) ([]byte, error) {
-	syncing := true
-
-	for {
-		buf := make([]byte, 1)
-		n, err := si.port.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				continue
-			}
-			return nil, err
-		}
-		if n == 0 {
-			continue
-		}
-
-		// Log each byte read from the serial port
-		log.Printf("Read byte: 0x%02X", buf[0])
-
-		// If we are syncing, we need to find the start of the packet
-		if syncing {
-			if buf[0] == START1 {
-				buffer.Reset()
-				buffer.WriteByte(buf[0])
-				syncing = false
-				log.Println("Found START1 byte, looking for START2...")
-				continue
-			} else {
-				log.Println("Unexpected byte, still looking for START1...")
-				continue
-			}
-		}
-
-		// Append byte to the buffer
-		buffer.WriteByte(buf[0])
-
-		// Once START1 is found, ensure START2 is next
-		if buffer.Len() == 2 {
-			if buffer.Bytes()[1] != START2 {
-				log.Println("START2 byte not found, resynchronizing...")
-				syncing = true
-				buffer.Reset()
-				continue
-			} else {
-				log.Println("START2 byte found, reading packet length...")
-			}
-		}
-
-		// If we have at least the header, read the packet length
-		if buffer.Len() == HEADER_LEN {
-			packetLen := int(buffer.Bytes()[2])<<8 + int(buffer.Bytes()[3])
-			log.Printf("Header detected: packetLen=%d", packetLen)
-
-			if packetLen > MAX_TO_FROM_RADIO_SIZE {
-				log.Printf("Invalid packet length: %d. Discarding packet.", packetLen)
-				syncing = true
-				buffer.Reset()
-				continue
-			}
-
-			totalLen := HEADER_LEN + packetLen
-
-			// If we have the full packet, return it
-			if buffer.Len() >= totalLen {
-				packet := buffer.Next(totalLen) // Read the complete packet
-				log.Printf("Full packet received: %s", hex.EncodeToString(packet))
-
-				return packet[HEADER_LEN:], nil // Return just the payload, stripping the header
-			}
-		}
-	}
+func (s *State) AddNode(node *generated.NodeInfo) {
+	s.nodes = append(s.nodes, node)
 }
 
-func handleMessage(data []byte, dispatcher *EventDispatcher) {
-	log.Printf("Attempting to parse packet: %s", hex.EncodeToString(data))
+func (s *State) AddChannel(channel *generated.Channel) {
+	s.channels = append(s.channels, channel)
+}
 
-	var packet generated.MeshPacket // Use the generated protobuf struct
-	if err := proto.Unmarshal(data, &packet); err != nil {
-		log.Printf("Failed to parse received data: %v", err)
-		log.Printf("Data: %s", hex.EncodeToString(data))
-		return
+func (s *State) AddConfig(config *generated.Config) {
+	s.configs = append(s.configs, config)
+}
+
+func (s *State) AddModule(module *generated.ModuleConfig) {
+	s.modules = append(s.modules, module)
+}
+
+func handleMessageProto(msg *generated.FromRadio, dispatcher *EventDispatcher, state *State) {
+	log.Printf("Raw message received: %+v", msg)
+
+	switch msg.GetPayloadVariant().(type) {
+	case *generated.FromRadio_MyInfo:
+		state.SetNodeInfo(msg.GetMyInfo())
+		log.Printf("Node info received: %+v", msg.GetMyInfo())
+	case *generated.FromRadio_Metadata:
+		state.SetDeviceMetadata(msg.GetMetadata())
+		log.Printf("Device metadata received: %+v", msg.GetMetadata())
+	case *generated.FromRadio_NodeInfo:
+		node := msg.GetNodeInfo()
+		state.AddNode(node)
+		log.Printf("Node info added: %+v", node)
+	case *generated.FromRadio_Channel:
+		channel := msg.GetChannel()
+		state.AddChannel(channel)
+		log.Printf("Channel info received: %+v", channel)
+	case *generated.FromRadio_Config:
+		cfg := msg.GetConfig()
+		state.AddConfig(cfg)
+		log.Printf("Config received: %+v", cfg)
+	case *generated.FromRadio_ModuleConfig:
+		cfg := msg.GetModuleConfig()
+		state.AddModule(cfg)
+		log.Printf("Module config received: %+v", cfg)
+	case *generated.FromRadio_Packet:
+		packet := msg.GetPacket()
+		log.Printf("Packet received: %+v", packet)
+		dispatcher.Dispatch(Event{Type: EventMeshPacketReceived, Data: packet})
+	case *generated.FromRadio_FileInfo:
+		fileInfo := msg.GetFileInfo()
+		log.Printf("File info received: %s (%d bytes)", fileInfo.FileName, fileInfo.SizeBytes)
+	case *generated.FromRadio_MqttClientProxyMessage:
+		mqttMessage := msg.GetMqttClientProxyMessage()
+		log.Printf("MQTT Proxy message received: topic: %s, data: %s", mqttMessage.Topic, string(mqttMessage.GetData()))
+		// You can dispatch the message to an event if needed or handle it here.
+	default:
+		log.Printf("Unknown message type received: %+v", msg)
 	}
-
-	// Log the parsed packet details for debugging
-	log.Printf("Parsed MeshPacket: From=%d, To=%d, Id=%d, Portnum=%d", packet.From, packet.To, packet.Id, packet.GetDecoded().Portnum)
-
-	// Create an event for the received packet
-	event := Event{
-		Type: EventMeshPacketReceived,
-		Data: &packet,
-	}
-
-	// Dispatch the event
-	dispatcher.Dispatch(event)
 }
 
 func handleMeshPacketReceived(event Event) {
 	packet, ok := event.Data.(*generated.MeshPacket)
 	if !ok {
+		log.Println("Failed to cast event data to MeshPacket")
 		return
 	}
 
-	timestamp := time.Now().Unix()
-	log.Printf("Received packet at %d from %d to %d, message ID: %d",
-		timestamp, packet.From, packet.To, packet.Id)
+	log.Printf("Received packet from %d to %d, message ID: %d", packet.From, packet.To, packet.Id)
 
-	// Check if the packet contains decoded data
 	decoded := packet.GetDecoded()
 	if decoded != nil {
 		switch decoded.Portnum {
-		case generated.PortNum_TELEMETRY_APP:
-			// Decode telemetry data
-			var telemetry generated.Telemetry
-			if err := proto.Unmarshal(decoded.Payload, &telemetry); err != nil {
-				log.Printf("Failed to parse telemetry data: %v", err)
-			} else {
-				// Print telemetry data in a human-readable format
-				log.Printf("Telemetry received: Battery level: %.2f%%, Voltage: %.2fV, Channel Utilization: %.2f%%, Air Utilization TX: %.2f%%, Uptime: %ds",
-					float64(telemetry.GetDeviceMetrics().GetBatteryLevel()),
-					float64(telemetry.GetDeviceMetrics().GetVoltage()),
-					float64(telemetry.GetDeviceMetrics().GetChannelUtilization()),
-					float64(telemetry.GetDeviceMetrics().GetAirUtilTx()),
-					telemetry.GetDeviceMetrics().GetUptimeSeconds(),
-				)
-			}
 		case generated.PortNum_TEXT_MESSAGE_APP:
-			// Decode and print text message
 			log.Printf("Text message received: %s", string(decoded.Payload))
+		case generated.PortNum_POSITION_APP:
+			log.Printf("Position message received: %v", decoded.Payload)
+		case generated.PortNum_TELEMETRY_APP:
+			log.Printf("Telemetry message received: %v", decoded.Payload)
+		// Add more port numbers here as needed
 		default:
-			log.Printf("Received packet with unhandled portnum: %d", decoded.Portnum)
+			// Silently skip unknown port numbers
+			return
 		}
 	} else {
-		log.Printf("Received packet with no decoded data.")
+		log.Printf("Received packet with no decoded data")
+	}
+}
+
+func NewSerialStreamConn(devPath string, mode *serial.Mode) (*StreamConn, error) {
+	port, err := serial.Open(devPath, mode) // Pass mode instead of baudRate
+	if err != nil {
+		return nil, err
+	}
+	return NewRadioStreamConn(port), nil
+}
+
+func (sc *StreamConn) WriteWake() error {
+	// Send 32 bytes of Start2 to wake the radio if sleeping.
+	_, err := sc.conn.Write(bytes.Repeat([]byte{START2}, 32))
+	if err != nil {
+		return err
+	}
+	time.Sleep(100 * time.Millisecond) // Wait 100ms after sending wake
+	return nil
+}
+
+func (sc *StreamConn) Read(out proto.Message) error {
+	header := make([]byte, HEADER_LEN)
+
+	for {
+		// Read the header
+		_, err := io.ReadFull(sc.conn, header)
+		if err != nil {
+			return fmt.Errorf("error reading header: %w", err)
+		}
+
+		// Check if the start bytes are correct
+		if header[0] != START1 || header[1] != START2 {
+			// Ignore invalid start bytes without logging
+			continue
+		}
+
+		// Read the message length (third and fourth bytes)
+		length := int(header[2])<<8 | int(header[3])
+		if length > MAX_TO_FROM_RADIO_SIZE {
+			// Ignore invalid length without logging
+			continue
+		}
+
+		// Read the message body
+		message := make([]byte, length)
+		_, err = io.ReadFull(sc.conn, message)
+		if err != nil {
+			return fmt.Errorf("error reading message body: %w", err)
+		}
+
+		// Unmarshal the protobuf message
+		return proto.Unmarshal(message, out)
 	}
 }
 
@@ -226,28 +278,46 @@ func main() {
 	// Register event handlers
 	dispatcher.RegisterHandler(EventMeshPacketReceived, handleMeshPacketReceived)
 
-	// Serial interface setup
+	// Serial stream setup
 	devPath := "/dev/cu.usbmodem1101" // Ensure this path is correct for your device
 	baudRate := 115200
 
-	si, err := NewSerialInterface(devPath, baudRate)
-	if err != nil {
-		log.Fatalf("Failed to open serial port: %v", err)
+	// Define serial communication mode (parameters)
+	mode := &serial.Mode{
+		BaudRate: baudRate,          // Baud rate for the device
+		DataBits: 8,                 // Typically 8 data bits
+		Parity:   serial.NoParity,   // No parity (can be OddParity or EvenParity if required)
+		StopBits: serial.OneStopBit, // 1 stop bit
 	}
-	defer si.Close()
 
-	buffer := bytes.NewBuffer(nil)
+	// Open the serial stream connection with the defined mode
+	streamConn, err := NewSerialStreamConn(devPath, mode) // Pass mode instead of just baudRate
+	if err != nil {
+		log.Fatalf("Failed to open serial stream: %v", err)
+	}
+	defer streamConn.Close()
+
+	state := &State{}
+
+	// Send initial config request
+	err = streamConn.Write(&generated.ToRadio{
+		PayloadVariant: &generated.ToRadio_WantConfigId{
+			WantConfigId: rand.Uint32(),
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to send config request: %v", err)
+	}
 
 	for {
-		packet, err := si.ReadPacket(buffer)
+		// Read incoming protobuf messages
+		var msg generated.FromRadio
+		err := streamConn.Read(&msg)
 		if err != nil {
-			log.Printf("Error reading packet: %v", err)
+			log.Printf("Error reading from stream: %v", err)
 			continue
 		}
-		if packet != nil {
-			handleMessage(packet, dispatcher)
-		} else {
-			log.Printf("No packet received.")
-		}
+		// Handle the received message
+		handleMessageProto(&msg, dispatcher, state)
 	}
 }
