@@ -271,6 +271,41 @@ func (sc *StreamConn) Read(out proto.Message) error {
 	}
 }
 
+func sendTextMessage(streamConn *StreamConn, to uint32, from uint32, message string) error {
+	// Construct the inner Decoded message (assuming there's a "Data" or similar type wrapping the Portnum and Payload)
+	decoded := &generated.Data{
+		Portnum: generated.PortNum_TEXT_MESSAGE_APP, // Set the port number for text message
+		Payload: []byte(message),                    // The actual text message payload
+	}
+
+	// Create the MeshPacket protobuf message and set its Decoded field
+	meshPacket := &generated.MeshPacket{
+		To:       to,   // Receiver ID (use a valid receiver node ID)
+		From:     from, // Sender ID (use your own node ID)
+		HopLimit: 3,
+		PayloadVariant: &generated.MeshPacket_Decoded{
+			Decoded: decoded,
+		},
+	}
+
+	// Create the ToRadio message with the MeshPacket
+	toRadio := &generated.ToRadio{
+		PayloadVariant: &generated.ToRadio_Packet{
+			Packet: meshPacket,
+		},
+	}
+
+	// Send the ToRadio message over the stream
+	err := streamConn.Write(toRadio)
+	if err != nil {
+		log.Printf("Failed to send text message: %v", err)
+		return err
+	}
+
+	log.Printf("Text message sent to %d: %s", to, message)
+	return nil
+}
+
 func main() {
 	// Initialize the event dispatcher
 	dispatcher := NewEventDispatcher()
@@ -307,6 +342,17 @@ func main() {
 	})
 	if err != nil {
 		log.Printf("Failed to send config request: %v", err)
+	}
+
+	// Specify the receiver and sender IDs and the message you want to send
+	to := uint32(2392398573)        // Replace with the actual receiver node ID
+	from := uint32(1183488843)      // Replace with your node ID
+	message := "Hello from GoLang!" // Your Payload message
+
+	// Send the text message
+	err = sendTextMessage(streamConn, to, from, message)
+	if err != nil {
+		log.Fatalf("Failed to send text message: %v", err)
 	}
 
 	for {
