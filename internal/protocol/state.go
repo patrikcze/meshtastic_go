@@ -8,7 +8,7 @@ type State struct {
 	nodeInfo       *generated.MyNodeInfo
 	deviceMetadata *generated.DeviceMetadata
 	nodes          []*generated.NodeInfo
-	channels       []*generated.Channel
+	channels       []*generated.Channel // Stores all received channels
 	configs        []*generated.Config
 	modules        []*generated.ModuleConfig
 }
@@ -25,7 +25,9 @@ func (s *State) AddNode(node *generated.NodeInfo) {
 	s.nodes = append(s.nodes, node)
 }
 
+// AddChannel adds a channel to the state
 func (s *State) AddChannel(channel *generated.Channel) {
+	// Prevent overwriting by appending the channel to the slice
 	s.channels = append(s.channels, channel)
 }
 

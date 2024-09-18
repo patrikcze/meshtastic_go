@@ -1,4 +1,3 @@
-// File: internal/protocol/message_handler.go
 package protocol
 
 import (
@@ -16,7 +15,7 @@ import (
 //
 // This function decodes the message and performs actions based on its type.
 func HandleMessageProto(msg *generated.FromRadio, dispatcher *transport.EventDispatcher, state *State) {
-	switch msg.GetPayloadVariant().(type) {
+	switch payload := msg.GetPayloadVariant().(type) {
 	case *generated.FromRadio_MyInfo:
 		state.SetNodeInfo(msg.GetMyInfo())
 		log.Printf("Node info received: %+v", msg.GetMyInfo())
@@ -31,14 +30,12 @@ func HandleMessageProto(msg *generated.FromRadio, dispatcher *transport.EventDis
 		log.Printf("Node info added: %+v", node)
 
 	case *generated.FromRadio_Channel:
-		channel := msg.GetChannel()
-		state.AddChannel(channel)
-		log.Printf("Channel info received: %+v", channel)
+		state.AddChannel(msg.GetChannel())
+		log.Printf("Channel info received: %+v", msg.GetChannel())
 
 	case *generated.FromRadio_Config:
-		cfg := msg.GetConfig()
-		state.AddConfig(cfg)
-		log.Printf("Config received: %+v", cfg)
+		HandleConfig(msg.GetConfig())
+		state.AddConfig(msg.GetConfig())
 
 	case *generated.FromRadio_ModuleConfig:
 		cfg := msg.GetModuleConfig()
@@ -63,6 +60,6 @@ func HandleMessageProto(msg *generated.FromRadio, dispatcher *transport.EventDis
 		log.Printf("Queue status received: %v", queueStatus)
 
 	default:
-		log.Printf("Unknown message type received: %+v", msg)
+		log.Printf("Unknown message type received: %+v", payload)
 	}
 }
