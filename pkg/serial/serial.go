@@ -6,7 +6,6 @@ import (
 
 const (
 	PORT_SPEED = 115200 //921600
-	STOP_BITS  = 1
 	DATA_BITS  = 8
 )
 
