@@ -42,11 +42,11 @@ func main() {
 		log.Printf("Failed to send config request: %v", err)
 	}
 
-	// Step 5: Send a test text message
-	err = protocol.SendTextMessage(streamConn, 532783092, 1419948843, "Connected to Device over Serial from GO!", false)
-	if err != nil {
-		log.Fatalf("Failed to send text message: %v", err)
-	}
+	// // Step 5: Send a test text message
+	// err = protocol.SendTextMessage(streamConn, 532783092, 1419948843, "Connected to Device over Serial from GO!", false)
+	// if err != nil {
+	// 	log.Fatalf("Failed to send text message: %v", err)
+	// }
 
 	// Step 6: Continuously read incoming messages from the radio device
 	for {
