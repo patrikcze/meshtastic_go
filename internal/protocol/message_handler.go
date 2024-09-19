@@ -31,7 +31,8 @@ func HandleMessageProto(msg *generated.FromRadio, dispatcher *transport.EventDis
 
 	case *generated.FromRadio_Channel:
 		HandleChannel(msg.GetChannel())
-		state.AddChannel(msg.GetChannel())
+		state.AddChannel(msg.GetChannel()) // Store channel in state
+		// Only call PrintChannelInfoTable after processing all messages or at certain conditions
 
 	case *generated.FromRadio_Config:
 		HandleConfig(msg.GetConfig())
@@ -59,7 +60,13 @@ func HandleMessageProto(msg *generated.FromRadio, dispatcher *transport.EventDis
 		queueStatus := msg.GetQueueStatus()
 		log.Printf("Queue status received: %v", queueStatus)
 
+	case *generated.FromRadio_ConfigCompleteId:
+		configCompleteId := msg.GetConfigCompleteId()
+		HandleConfigComplete(configCompleteId)
+		log.Printf("Received config completion for ID: %d", configCompleteId)
+
 	default:
 		log.Printf("Unknown message type received: %+v", payload)
 	}
+
 }

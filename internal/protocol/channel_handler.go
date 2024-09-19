@@ -9,11 +9,15 @@ import (
 
 // HandlerChannel processes and logs channel data in a structured way
 func HandleChannel(channel *generated.Channel) {
-	PrintChannelInfoTable([]*generated.Channel{channel})
+	channels := append([]*generated.Channel{}, channel)
+	PrintChannelInfoTable(channels)
 }
 
-// PrintChannelInfoTable prints all channel information in a tabular format
 func PrintChannelInfoTable(channels []*generated.Channel) {
+	if len(channels) == 0 {
+		return // No channels to print
+	}
+
 	// Create a new tabwriter for nicely formatted table output
 	writer := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 

@@ -32,6 +32,8 @@ func main() {
 
 	dispatcher := transport.NewEventDispatcher()
 	dispatcher.RegisterHandler("MeshPacketReceived", protocol.HandleMeshPacketReceived)
+	// Register new handler for ConfigCompleteId
+	//dispatcher.RegisterHandler("ConfigCompleteId", handleConfigCompletee)
 
 	// Initialize protocol state
 	state := &transport.State{}

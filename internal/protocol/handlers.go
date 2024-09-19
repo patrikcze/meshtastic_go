@@ -37,6 +37,12 @@ func SendConfigRequest(streamConn *transport.StreamConn, configID uint32) error 
 	return nil
 }
 
+func HandleConfigComplete(configCompleteId uint32) {
+	// Handle the configuration completion logic here
+	log.Printf("Configuration request completed for ID: %d", configCompleteId)
+	// You might want to trigger additional actions here, like updating state or notifying the user
+}
+
 // HandleMeshPacketReceived processes incoming MeshPacket events
 func HandleMeshPacketReceived(event transport.Event) {
 	packet, ok := event.Data.(*generated.MeshPacket)
