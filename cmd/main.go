@@ -6,36 +6,49 @@ import (
 	"meshtastic_go/internal/protocol"
 	"meshtastic_go/internal/transport"
 	"meshtastic_go/pkg/generated"
-
-	"go.bug.st/serial"
+	"meshtastic_go/pkg/serial"
 )
 
 func main() {
+	// Step 1: Detect available USB serial ports for known devices
+	ports := serial.GetPorts()
+	if len(ports) == 0 {
+		log.Fatalf("No suitable USB serial ports found!")
+	}
+
+	// Pick the first detected port for simplicity (can be expanded to handle multiple devices)
+	devPath := ports[0]
+	log.Printf("Using serial port: %s", devPath)
+
+	// Step 2: Establish a connection using the Connect function
+	streamPort, err := serial.Connect(devPath)
+	if err != nil {
+		log.Fatalf("Failed to open serial connection: %v", err)
+	}
+	defer streamPort.Close()
+
+	// Step 3: Create the StreamConn object for further protocol handling
+	streamConn := transport.NewRadioStreamConn(streamPort)
+
 	dispatcher := transport.NewEventDispatcher()
 	dispatcher.RegisterHandler("MeshPacketReceived", protocol.HandleMeshPacketReceived)
 
-	devPath := "/dev/cu.usbmodem1101"
-	mode := &serial.Mode{BaudRate: 115200, DataBits: 8, Parity: serial.NoParity, StopBits: serial.OneStopBit}
+	// Initialize protocol state
+	state := &transport.State{}
 
-	streamConn, err := transport.NewSerialStreamConn(devPath, mode)
-	if err != nil {
-		log.Fatalf("Failed to open serial stream: %v", err)
-	}
-	defer streamConn.Close()
-
-	state := &protocol.State{}
-
+	// Step 4: Send configuration request
 	err = protocol.SendConfigRequest(streamConn, rand.Uint32())
 	if err != nil {
 		log.Printf("Failed to send config request: %v", err)
 	}
 
-	// Example message send
+	// Step 5: Send a test text message
 	err = protocol.SendTextMessage(streamConn, 532783092, 1419948843, "Connected to Device over Serial from GO!", false)
 	if err != nil {
 		log.Fatalf("Failed to send text message: %v", err)
 	}
 
+	// Step 6: Continuously read incoming messages from the radio device
 	for {
 		var msg generated.FromRadio
 		err := streamConn.Read(&msg)

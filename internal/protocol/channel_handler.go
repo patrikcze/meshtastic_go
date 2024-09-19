@@ -1,19 +1,43 @@
 package protocol
 
 import (
-	"log"
+	"fmt"
+	"meshtastic_go/pkg/generated"
+	"os"
+	"text/tabwriter"
 )
 
-// LogChannels logs all channels stored in the state
-func (s *State) LogChannels() {
-	log.Println("List of Channels:")
-	for _, channel := range s.channels {
+// HandlerChannel processes and logs channel data in a structured way
+func HandleChannel(channel *generated.Channel) {
+	PrintChannelInfoTable([]*generated.Channel{channel})
+}
+
+// PrintChannelInfoTable prints all channel information in a tabular format
+func PrintChannelInfoTable(channels []*generated.Channel) {
+	// Create a new tabwriter for nicely formatted table output
+	writer := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+
+	// Print the table header with borders
+	fmt.Fprintln(writer, "┌──────┬──────────────────┬─────────┬───────────┬──────────────────────┐")
+	fmt.Fprintln(writer, "│ Idx  │ Name             │ Uplink  │ Downlink  │ Position Precision   │")
+	fmt.Fprintln(writer, "├──────┼──────────────────┼─────────┼───────────┼──────────────────────┤")
+
+	// Iterate over the channels and print their details with borders
+	for _, channel := range channels {
 		settings := channel.GetSettings()
-		log.Printf("- Index: %d", channel.GetIndex())
-		log.Printf("  Name: %s", settings.GetName())
-		log.Printf("  Uplink Enabled: %v", settings.GetUplinkEnabled())
-		log.Printf("  Downlink Enabled: %v", settings.GetDownlinkEnabled())
-		log.Printf("  Position Precision: %d", settings.GetModuleSettings().GetPositionPrecision())
-		log.Println("-----")
+		moduleSettings := settings.GetModuleSettings()
+		fmt.Fprintf(writer, "│ %-4d │ %-16s │ %-7t │ %-9t │ %-20d │\n",
+			channel.GetIndex(),
+			settings.GetName(),
+			settings.GetUplinkEnabled(),
+			settings.GetDownlinkEnabled(),
+			moduleSettings.GetPositionPrecision(),
+		)
 	}
+
+	// Print table footer
+	fmt.Fprintln(writer, "└──────┴──────────────────┴─────────┴───────────┴──────────────────────┘")
+
+	// Flush the writer to ensure the output is printed
+	writer.Flush()
 }
