@@ -21,6 +21,7 @@ var knownDevices = []usbDevice{
 	{VID: "10C4", PID: "EA60"},
 }
 
+// GetPorts returns a list of available serial ports.
 func GetPorts() []string {
 	ports, err := enumerator.GetDetailedPortsList()
 	if err != nil {

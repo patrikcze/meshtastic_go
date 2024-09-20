@@ -1,6 +1,6 @@
 module meshtastic_go
 
-go 1.22.6
+go 1.23.1
 
 require (
 	github.com/charmbracelet/log v0.4.0

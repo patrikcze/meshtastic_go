@@ -1,0 +1,69 @@
+# Go specific files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.a
+*.o
+*.prof
+*.log
+
+# Dependency directories
+/vendor/
+/Gopkg.lock
+/gopkg.toml
+/go.sum
+/go.mod
+
+# IDE and editor-specific files
+# VSCode
+.vscode/
+*.code-workspace
+
+# IntelliJ IDEA
+.idea/
+*.iml
+
+# GoLand
+*.iml
+*.idea/
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Visual Studio Code
+*.code-workspace
+.vscode/
+
+# macOS files
+.DS_Store
+
+# Linux system files
+*~
+
+# Windows system files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Build directories
+/build/
+bin/
+out/
+
+# Other files
+*.bak
+*.tmp
+*.temp
+
+# Compiled binary files
+/bin/
