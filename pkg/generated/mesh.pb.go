@@ -2666,7 +2666,7 @@ func (x *FromRadio) GetLogRecord() *LogRecord {
 	return nil
 }
 
-func (x *FromRadio) GetConfigCompleteId() uint32 {
+func (x *FromRadio) GetConfigCompleteID() uint32 {
 	if x, ok := x.GetPayloadVariant().(*FromRadio_ConfigCompleteId); ok {
 		return x.ConfigCompleteId
 	}

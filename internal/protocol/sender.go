@@ -6,7 +6,7 @@ import (
 	"meshtastic_go/pkg/generated"
 )
 
-// sendTextMessage sends a text message to a specific receiver over the given stream connection.
+// SendTextMessage sends a text message to a specific receiver over the given stream connection.
 // Parameters:
 //   - streamConn: The connection stream used to send the message.
 //   - to: The recipient node ID.

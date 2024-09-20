@@ -17,7 +17,7 @@ type HandlerRegistry struct {
 	handlers          map[string][]MessageHandler
 }
 
-// New creates a new instance of HandlerRegistry. Set errorOnNoHandler to true if you want HandleMessage to return
+// NewHandlerRegistry creates a new instance of HandlerRegistry. Set errorOnNoHandler to true if you want HandleMessage to return
 // an error if there are no handlers registered for a given msg when HandleMessage is called.
 func NewHandlerRegistry(errorOnNoHandler bool) *HandlerRegistry {
 	return &HandlerRegistry{

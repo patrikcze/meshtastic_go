@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
+	"math"
 	"sync"
 	"time"
 
@@ -82,7 +84,10 @@ func (c *StreamConn) ReadBytes() ([]byte, error) {
 		// Check for Start1.
 		if buf[0] != Start1 {
 			if c.DebugWriter != nil {
-				c.DebugWriter.Write(buf[0:1])
+				if _, err := c.DebugWriter.Write(buf[0:1]); err != nil {
+					// Handle the error appropriately, e.g., log it
+					log.Printf("Failed to write to DebugWriter: %v", err)
+				}
 			}
 			continue
 		}
@@ -161,7 +166,13 @@ func (c *StreamConn) WriteBytes(data []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 
-	if err := writeStreamHeader(c.conn, uint16(len(data))); err != nil {
+	dataLen := len(data)
+	// Check for uint16 overflow
+	if dataLen > math.MaxUint16 {
+		return fmt.Errorf("data length exceeds uint16 max: %d > %d", dataLen, math.MaxUint16)
+	}
+
+	if err := writeStreamHeader(c.conn, uint16(dataLen)); err != nil {
 		return fmt.Errorf("writing stream header: %w", err)
 	}
 

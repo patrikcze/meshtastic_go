@@ -5,14 +5,15 @@ import (
 )
 
 const (
-	PORT_SPEED = 115200 //921600
-	DATA_BITS  = 8
+	portSpeed = 115200 //921600
+	dataBits  = 8
 )
 
+// Connect returns a list of available serial ports.
 func Connect(port string) (serial.Port, error) {
 	mode := &serial.Mode{
-		BaudRate: PORT_SPEED,
-		DataBits: DATA_BITS,
+		BaudRate: portSpeed,
+		DataBits: dataBits,
 	}
 	p, err := serial.Open(port, mode)
 	if err != nil {

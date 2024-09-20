@@ -60,10 +60,10 @@ func HandleMessageProto(msg *generated.FromRadio, dispatcher *transport.EventDis
 		queueStatus := msg.GetQueueStatus()
 		log.Printf("Queue status received: %v", queueStatus)
 
-	case *generated.FromRadio_ConfigCompleteId:
-		configCompleteId := msg.GetConfigCompleteId()
-		HandleConfigComplete(configCompleteId)
-		log.Printf("Received config completion for ID: %d", configCompleteId)
+	case *generated.FromRadio_ConfigCompleteId: //nolint:golint
+		configCompleteID := msg.GetConfigCompleteID()
+		HandleConfigComplete(configCompleteID)
+		log.Printf("Received config completion for ID: %d", configCompleteID)
 
 	default:
 		log.Printf("Unknown message type received: %+v", payload)

@@ -1,8 +1,10 @@
+// Description: Main entry point for the Meshtastic Go CLI application.
 package main
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"log"
-	"math/rand"
 	"meshtastic_go/internal/protocol"
 	"meshtastic_go/internal/transport"
 	"meshtastic_go/pkg/generated"
@@ -39,16 +41,21 @@ func main() {
 	state := &transport.State{}
 
 	// Step 4: Send configuration request
-	err = protocol.SendConfigRequest(streamConn, rand.Uint32())
+	// Inside the main function
+	var configID uint32
+	if err := binary.Read(rand.Reader, binary.LittleEndian, &configID); err != nil {
+		log.Fatalf("failed to generate random config ID: %v", err)
+	}
+	err = protocol.SendConfigRequest(streamConn, configID)
 	if err != nil {
 		log.Printf("Failed to send config request: %v", err)
 	}
 
-	// // Step 5: Send a test text message
-	// err = protocol.SendTextMessage(streamConn, 532783092, 1419948843, "Connected to Device over Serial from GO!", false)
-	// if err != nil {
-	// 	log.Fatalf("Failed to send text message: %v", err)
-	// }
+	// Step 5: Send a test text message
+	err = protocol.SendTextMessage(streamConn, 532783092, 1419948843, "Connected to Device over Serial from GO!", false)
+	if err != nil {
+		log.Fatalf("Failed to send text message: %v", err)
+	}
 
 	// Step 6: Continuously read incoming messages from the radio device
 	for {
