@@ -67,3 +67,6 @@ out/
 
 # Compiled binary files
 /bin/
+
+# Meshtastic Go Log
+*.log

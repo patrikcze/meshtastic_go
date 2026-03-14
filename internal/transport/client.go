@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
-	"meshtastic_go/pkg/generated"
 	meshtastic "meshtastic_go/pkg/generated"
 
 	"google.golang.org/protobuf/proto"
@@ -20,19 +20,29 @@ var (
 	ErrTimeout = errors.New("timeout connecting to radio")
 )
 
-// HandlerFunc is a function that handles a protobuf message.
-type HandlerFunc func(message proto.Message)
+const (
+	// eventChanSize is the buffer size for the Events channel.
+	eventChanSize = 128
+	// defaultHopLimit is the default hop count for outgoing packets.
+	defaultHopLimit = 3
+)
 
-// Client is a client for interacting with a Meshtastic radio.
+// Client is the single owner of a Meshtastic radio connection.
+// After Connect returns, a background goroutine reads packets and emits
+// typed RadioEvents on the Events channel for the UI to consume.
 type Client struct {
-	sc       *StreamConn
-	handlers *HandlerRegistry
-	log      *slog.Logger
+	sc  *StreamConn
+	log *slog.Logger
+
+	// Events delivers typed radio events to the consumer (UI layer).
+	// The channel is closed when the read goroutine exits.
+	Events chan RadioEvent
 
 	State State
 }
 
-// State represents the state of the client.
+// State holds all configuration and node data received from the radio.
+// All public methods are safe for concurrent access.
 type State struct {
 	sync.RWMutex
 	complete       bool
@@ -45,262 +55,395 @@ type State struct {
 	modules        []*meshtastic.ModuleConfig
 }
 
-// Complete returns true if the configuration is complete.
+// ---------- State read accessors (return clones) ----------
+
+// Complete returns true if the initial configuration handshake finished.
 func (s *State) Complete() bool {
 	s.RLock()
 	defer s.RUnlock()
 	return s.complete
 }
 
-// ConfigID returns the configuration ID.
+// ConfigID returns the configuration handshake ID.
 func (s *State) ConfigID() uint32 {
 	s.RLock()
 	defer s.RUnlock()
 	return s.configID
 }
 
-// NodeInfo returns the node information.
+// NodeInfo returns the local node metadata.
 func (s *State) NodeInfo() *meshtastic.MyNodeInfo {
 	s.RLock()
 	defer s.RUnlock()
-	return s.nodeInfo
+	if s.nodeInfo == nil {
+		return nil
+	}
+	return proto.Clone(s.nodeInfo).(*meshtastic.MyNodeInfo)
 }
 
 // DeviceMetadata returns the device metadata.
 func (s *State) DeviceMetadata() *meshtastic.DeviceMetadata {
 	s.RLock()
 	defer s.RUnlock()
+	if s.deviceMetadata == nil {
+		return nil
+	}
 	return proto.Clone(s.deviceMetadata).(*meshtastic.DeviceMetadata)
 }
 
-// Nodes returns the list of nodes.
+// Nodes returns a cloned list of all known nodes.
 func (s *State) Nodes() []*meshtastic.NodeInfo {
 	s.RLock()
 	defer s.RUnlock()
-	var nodeInfos []*meshtastic.NodeInfo
-	for _, n := range s.nodes {
-		nodeInfos = append(nodeInfos, proto.Clone(n).(*meshtastic.NodeInfo))
+	out := make([]*meshtastic.NodeInfo, len(s.nodes))
+	for i, n := range s.nodes {
+		out[i] = proto.Clone(n).(*meshtastic.NodeInfo)
 	}
-	return nodeInfos
+	return out
 }
 
-// Channels returns the list of channels.
+// Channels returns a cloned list of all configured channels.
 func (s *State) Channels() []*meshtastic.Channel {
 	s.RLock()
 	defer s.RUnlock()
-	var channels []*meshtastic.Channel
-	for _, n := range s.channels {
-		channels = append(channels, proto.Clone(n).(*meshtastic.Channel))
+	out := make([]*meshtastic.Channel, len(s.channels))
+	for i, c := range s.channels {
+		out[i] = proto.Clone(c).(*meshtastic.Channel)
 	}
-	return channels
+	return out
 }
 
-// Configs returns the list of configurations.
+// Configs returns a cloned list of all configuration sections.
 func (s *State) Configs() []*meshtastic.Config {
 	s.RLock()
 	defer s.RUnlock()
-	var configs []*meshtastic.Config
-	for _, n := range s.configs {
-		configs = append(configs, proto.Clone(n).(*meshtastic.Config))
+	out := make([]*meshtastic.Config, len(s.configs))
+	for i, c := range s.configs {
+		out[i] = proto.Clone(c).(*meshtastic.Config)
 	}
-	return configs
+	return out
 }
 
-// Modules returns the list of modules.
+// Modules returns a cloned list of all module configurations.
 func (s *State) Modules() []*meshtastic.ModuleConfig {
 	s.RLock()
 	defer s.RUnlock()
-	var configs []*meshtastic.ModuleConfig
-	for _, n := range s.modules {
-		configs = append(configs, proto.Clone(n).(*meshtastic.ModuleConfig))
+	out := make([]*meshtastic.ModuleConfig, len(s.modules))
+	for i, m := range s.modules {
+		out[i] = proto.Clone(m).(*meshtastic.ModuleConfig)
 	}
-	return configs
+	return out
 }
 
-// SetComplete sets the configuration complete flag.
-func (s *State) SetComplete(complete bool) {
+// ---------- State write methods ----------
+
+// SetComplete marks the configuration phase as done.
+func (s *State) SetComplete(v bool) {
 	s.Lock()
 	defer s.Unlock()
-	s.complete = complete
+	s.complete = v
 }
 
-// SetConfigID sets the configuration ID.
-func (s *State) SetConfigID(configID uint32) {
+// SetConfigID stores the random config handshake ID.
+func (s *State) SetConfigID(id uint32) {
 	s.Lock()
 	defer s.Unlock()
-	s.configID = configID
+	s.configID = id
 }
 
-// SetNodeInfo sets the node information.
-func (s *State) SetNodeInfo(nodeInfo *meshtastic.MyNodeInfo) {
+// SetNodeInfo stores the local MyNodeInfo.
+func (s *State) SetNodeInfo(info *meshtastic.MyNodeInfo) {
 	s.Lock()
 	defer s.Unlock()
-	s.nodeInfo = nodeInfo
+	s.nodeInfo = info
 }
 
-// SetDeviceMetadata sets the device metadata.
-func (s *State) SetDeviceMetadata(deviceMetadata *meshtastic.DeviceMetadata) {
+// SetDeviceMetadata stores the device metadata.
+func (s *State) SetDeviceMetadata(meta *meshtastic.DeviceMetadata) {
 	s.Lock()
 	defer s.Unlock()
-	s.deviceMetadata = deviceMetadata
+	s.deviceMetadata = meta
 }
 
-// AddNode adds a node to the list of nodes.
-func (s *State) AddNode(node *meshtastic.NodeInfo) {
+// UpsertNode inserts or updates a node by Num.
+func (s *State) UpsertNode(node *meshtastic.NodeInfo) {
 	s.Lock()
 	defer s.Unlock()
+	for i, n := range s.nodes {
+		if n.Num == node.Num {
+			s.nodes[i] = node
+			return
+		}
+	}
 	s.nodes = append(s.nodes, node)
 }
 
-// AddChannel adds a channel to the list of channels.
-func (s *State) AddChannel(channel *meshtastic.Channel) {
+// AddChannel appends a channel to the list.
+func (s *State) AddChannel(ch *meshtastic.Channel) {
 	s.Lock()
 	defer s.Unlock()
-	s.channels = append(s.channels, channel)
+	s.channels = append(s.channels, ch)
 }
 
-// AddConfig adds a configuration to the list of configurations.
-func (s *State) AddConfig(config *meshtastic.Config) {
+// AddConfig appends a config section.
+func (s *State) AddConfig(cfg *meshtastic.Config) {
 	s.Lock()
 	defer s.Unlock()
-	s.configs = append(s.configs, config)
+	s.configs = append(s.configs, cfg)
 }
 
-// AddModule adds a module to the list of modules.
-func (s *State) AddModule(module *meshtastic.ModuleConfig) {
+// AddModule appends a module config.
+func (s *State) AddModule(mod *meshtastic.ModuleConfig) {
 	s.Lock()
 	defer s.Unlock()
-	s.modules = append(s.modules, module)
+	s.modules = append(s.modules, mod)
 }
 
-// NewClient creates a new client.
-func NewClient(sc *StreamConn, errorOnNoHandler bool) *Client {
+// ---------- Client construction ----------
+
+// NewClient creates a new Client that owns the given StreamConn.
+func NewClient(sc *StreamConn) *Client {
 	return &Client{
-		// TODO: allow consumer to specify logger
-		log:      slog.Default().WithGroup("client"),
-		sc:       sc,
-		handlers: NewHandlerRegistry(errorOnNoHandler),
+		log:    slog.Default().WithGroup("client"),
+		sc:     sc,
+		Events: make(chan RadioEvent, eventChanSize),
 	}
 }
 
-// sendGetConfig sends a GetConfig message to the radio.
-func (c *Client) sendGetConfig() error {
-	var r uint32
-	// Generate a random uint32 using crypto/rand
-	if err := binary.Read(rand.Reader, binary.LittleEndian, &r); err != nil {
-		return fmt.Errorf("failed to generate random config ID: %w", err)
+// ---------- Public API ----------
+
+// MyNodeNum returns the local node number, or 0 if not yet known.
+func (c *Client) MyNodeNum() uint32 {
+	info := c.State.NodeInfo()
+	if info == nil {
+		return 0
+	}
+	return info.MyNodeNum
+}
+
+// NodeName returns the long name for a given node number, or "!<hex>" if unknown.
+func (c *Client) NodeName(num uint32) string {
+	c.State.RLock()
+	defer c.State.RUnlock()
+	for _, n := range c.State.nodes {
+		if n.Num == num && n.User != nil && n.User.LongName != "" {
+			return n.User.LongName
+		}
+	}
+	return fmt.Sprintf("!%08x", num)
+}
+
+// LocalNodeName returns the long name of the local node, falling back to the hex ID.
+func (c *Client) LocalNodeName() string {
+	num := c.MyNodeNum()
+	if num == 0 {
+		return "Unknown"
+	}
+	return c.NodeName(num)
+}
+
+// SendText sends a text message to the specified destination on the given channel.
+// Use 0xFFFFFFFF for channel broadcasts.
+func (c *Client) SendText(to uint32, channelIndex uint32, message string) error {
+	decoded := &meshtastic.Data{
+		Portnum:      meshtastic.PortNum_TEXT_MESSAGE_APP,
+		Payload:      []byte(message),
+		WantResponse: false,
 	}
 
-	c.State.configID = r
-	msg := &generated.ToRadio{
-		PayloadVariant: &generated.ToRadio_WantConfigId{
-			WantConfigId: r,
+	packet := &meshtastic.MeshPacket{
+		To:       to,
+		From:     c.MyNodeNum(),
+		Channel:  channelIndex,
+		HopLimit: defaultHopLimit,
+		WantAck:  true,
+		PayloadVariant: &meshtastic.MeshPacket_Decoded{
+			Decoded: decoded,
 		},
 	}
-	c.log.Debug("sending want config", "id", r)
-	if err := c.sc.Write(msg); err != nil {
-		return fmt.Errorf("writing want config command: %w", err)
+
+	toRadio := &meshtastic.ToRadio{
+		PayloadVariant: &meshtastic.ToRadio_Packet{
+			Packet: packet,
+		},
 	}
-	c.log.Debug("sent want config")
+
+	if err := c.sc.Write(toRadio); err != nil {
+		return fmt.Errorf("sending text message: %w", err)
+	}
+	c.log.Debug("text message sent", "to", to, "channel", channelIndex, "len", len(message))
 	return nil
 }
 
-// Handle registers a handler for a protobuf message.
-func (c *Client) Handle(kind proto.Message, handler MessageHandler) {
-	c.handlers.RegisterHandler(kind, handler)
+// Close shuts down the underlying stream connection.
+func (c *Client) Close() error {
+	return c.sc.Close()
 }
 
-// SendToRadio sends a message to the radio.
-func (c *Client) SendToRadio(msg *meshtastic.ToRadio) error {
-	return c.sc.Write(msg)
-}
-
-// Connect connects to the radio.
+// Connect performs the config handshake and starts the background read goroutine.
+// It blocks until the config phase completes or ctx expires.
 func (c *Client) Connect(ctx context.Context) error {
 	if err := c.sendGetConfig(); err != nil {
 		return fmt.Errorf("requesting config: %w", err)
 	}
+
 	cfgComplete := make(chan struct{})
-	go func() {
-		for {
-			msg := &meshtastic.FromRadio{}
-			err := c.sc.Read(msg)
-			if err != nil {
-				c.log.Error("error reading from radio", "err", err)
-				continue
-			}
-			c.log.Debug("received message from radio", "msg", msg)
-			var variant proto.Message
-			switch msg.GetPayloadVariant().(type) {
-			// These pbufs all get sent upon initial connection to the node
-			case *meshtastic.FromRadio_MyInfo:
-				c.State.SetNodeInfo(msg.GetMyInfo())
-				variant = c.State.nodeInfo
-			case *meshtastic.FromRadio_Metadata:
-				c.State.SetDeviceMetadata(msg.GetMetadata())
-				variant = c.State.deviceMetadata
-			case *meshtastic.FromRadio_NodeInfo:
-				node := msg.GetNodeInfo()
-				c.State.AddNode(node)
-				variant = node
-			case *meshtastic.FromRadio_Channel:
-				channel := msg.GetChannel()
-				c.State.AddChannel(channel)
-				variant = channel
-			case *meshtastic.FromRadio_Config:
-				cfg := msg.GetConfig()
-				c.State.AddConfig(cfg)
-				variant = cfg
-			case *meshtastic.FromRadio_ModuleConfig:
-				cfg := msg.GetModuleConfig()
-				c.State.AddModule(cfg)
-				variant = cfg
-			case *meshtastic.FromRadio_ConfigCompleteId:
-				// logged here because it's not an actual proto.Message that we can call handlers on
-				c.log.Debug("config complete")
-				if !c.State.Complete() {
-					close(cfgComplete)
-				}
-				c.State.SetComplete(true)
-				continue
-				// below are packets not part of initial connection
+	go c.readLoop(cfgComplete)
 
-			case *meshtastic.FromRadio_LogRecord:
-				variant = msg.GetLogRecord()
-			case *meshtastic.FromRadio_MqttClientProxyMessage:
-				variant = msg.GetMqttClientProxyMessage()
-			case *meshtastic.FromRadio_QueueStatus:
-				variant = msg.GetQueueStatus()
-			case *meshtastic.FromRadio_Rebooted:
-				// true if radio just rebooted
-				// logged here because it's not an actual proto.Message that we can call handlers on
-				c.log.Debug("rebooted", "rebooted", msg.GetRebooted())
+	select {
+	case <-ctx.Done():
+		return ErrTimeout
+	case <-cfgComplete:
+		return nil
+	}
+}
 
-				continue
-			case *meshtastic.FromRadio_XmodemPacket:
-				variant = msg.GetXmodemPacket()
-			case *meshtastic.FromRadio_Packet:
-				variant = msg.GetPacket()
-			default:
-				c.log.Warn("unhandled protobuf from radio")
-			}
+// ---------- Internal ----------
 
-			if !c.State.Complete() {
-				continue
-			}
-			err = c.handlers.HandleMessage(variant)
-			if err != nil {
-				c.log.Error("error handling message", "err", err)
-			}
-		}
-	}()
+// sendGetConfig sends WantConfigId to kick off the handshake.
+func (c *Client) sendGetConfig() error {
+	var r uint32
+	if err := binary.Read(rand.Reader, binary.LittleEndian, &r); err != nil {
+		return fmt.Errorf("generating random config ID: %w", err)
+	}
+	c.State.SetConfigID(r)
+
+	msg := &meshtastic.ToRadio{
+		PayloadVariant: &meshtastic.ToRadio_WantConfigId{
+			WantConfigId: r,
+		},
+	}
+	c.log.Debug("sending want config", "id", r)
+	return c.sc.Write(msg)
+}
+
+// readLoop continuously reads FromRadio messages, populates State during config,
+// and emits typed events after config is complete.
+func (c *Client) readLoop(cfgComplete chan struct{}) {
+	defer close(c.Events)
+	configSignaled := false
 
 	for {
-		select {
-		case <-ctx.Done():
-			return ErrTimeout
-		case <-cfgComplete:
-			return nil
+		msg := &meshtastic.FromRadio{}
+		if err := c.sc.Read(msg); err != nil {
+			c.log.Error("read error", "err", err)
+			c.emit(ConnectionEvent{Status: StatusDisconnected, Message: err.Error()})
+			return
 		}
+
+		switch v := msg.GetPayloadVariant().(type) {
+		// --- Config phase packets ---
+		case *meshtastic.FromRadio_MyInfo:
+			c.State.SetNodeInfo(msg.GetMyInfo())
+		case *meshtastic.FromRadio_Metadata:
+			c.State.SetDeviceMetadata(msg.GetMetadata())
+		case *meshtastic.FromRadio_NodeInfo:
+			node := msg.GetNodeInfo()
+			c.State.UpsertNode(node)
+			c.emit(NodeUpdateEvent{Node: proto.Clone(node).(*meshtastic.NodeInfo)})
+		case *meshtastic.FromRadio_Channel:
+			c.State.AddChannel(msg.GetChannel())
+		case *meshtastic.FromRadio_Config:
+			c.State.AddConfig(msg.GetConfig())
+		case *meshtastic.FromRadio_ModuleConfig:
+			c.State.AddModule(msg.GetModuleConfig())
+		case *meshtastic.FromRadio_ConfigCompleteId:
+			c.log.Debug("config complete", "id", v.ConfigCompleteId)
+			if !configSignaled {
+				configSignaled = true
+				c.State.SetComplete(true)
+				close(cfgComplete)
+				c.emit(ConnectionEvent{Status: StatusConnected, Message: "Configuration complete"})
+			}
+
+		// --- Runtime packets ---
+		case *meshtastic.FromRadio_Packet:
+			c.handleMeshPacket(msg.GetPacket())
+		case *meshtastic.FromRadio_LogRecord:
+			// Device debug logs — ignore in TUI mode.
+		case *meshtastic.FromRadio_QueueStatus:
+			// Queue status — ignore for now.
+		case *meshtastic.FromRadio_Rebooted:
+			c.log.Warn("device rebooted")
+			c.emit(ConnectionEvent{Status: StatusDisconnected, Message: "Device rebooted"})
+		default:
+			c.log.Debug("unhandled FromRadio variant", "type", fmt.Sprintf("%T", msg.GetPayloadVariant()))
+		}
+	}
+}
+
+// handleMeshPacket decodes a MeshPacket and emits the appropriate typed event.
+func (c *Client) handleMeshPacket(pkt *meshtastic.MeshPacket) {
+	if pkt == nil {
+		return
+	}
+
+	decoded := pkt.GetDecoded()
+	if decoded == nil {
+		// Encrypted packet we can't decode — skip.
+		return
+	}
+
+	switch decoded.Portnum {
+	case meshtastic.PortNum_TEXT_MESSAGE_APP:
+		ts := time.Now()
+		if pkt.RxTime > 0 {
+			ts = time.Unix(int64(pkt.RxTime), 0)
+		}
+		c.emit(TextMessageEvent{
+			From:       pkt.From,
+			To:         pkt.To,
+			Channel:    pkt.Channel,
+			Content:    string(decoded.Payload),
+			SenderName: c.NodeName(pkt.From),
+			Timestamp:  ts,
+			MessageID:  pkt.Id,
+		})
+
+	case meshtastic.PortNum_POSITION_APP:
+		pos := &meshtastic.Position{}
+		if err := proto.Unmarshal(decoded.Payload, pos); err != nil {
+			c.log.Warn("failed to decode position", "err", err)
+			return
+		}
+		c.emit(PositionEvent{From: pkt.From, Position: pos})
+
+	case meshtastic.PortNum_TELEMETRY_APP:
+		tel := &meshtastic.Telemetry{}
+		if err := proto.Unmarshal(decoded.Payload, tel); err != nil {
+			c.log.Warn("failed to decode telemetry", "err", err)
+			return
+		}
+		if dm := tel.GetDeviceMetrics(); dm != nil {
+			c.emit(TelemetryEvent{From: pkt.From, Metrics: dm})
+		}
+
+	case meshtastic.PortNum_NODEINFO_APP:
+		user := &meshtastic.User{}
+		if err := proto.Unmarshal(decoded.Payload, user); err != nil {
+			c.log.Warn("failed to decode nodeinfo", "err", err)
+			return
+		}
+		ni := &meshtastic.NodeInfo{
+			Num:       pkt.From,
+			User:      user,
+			LastHeard: pkt.RxTime,
+			Snr:       pkt.RxSnr,
+		}
+		c.State.UpsertNode(ni)
+		c.emit(NodeUpdateEvent{Node: proto.Clone(ni).(*meshtastic.NodeInfo)})
+
+	default:
+		c.log.Debug("unhandled portnum", "portnum", decoded.Portnum, "from", pkt.From)
+	}
+}
+
+// emit sends an event to the Events channel without blocking.
+// If the channel is full the event is dropped (the UI is too slow).
+func (c *Client) emit(ev RadioEvent) {
+	select {
+	case c.Events <- ev:
+	default:
+		c.log.Warn("event channel full, dropping event", "type", fmt.Sprintf("%T", ev))
 	}
 }

@@ -2,658 +2,800 @@
 package ui
 
 import (
-	"context"
 	"fmt"
+	"sort"
 	"strings"
-	"time"
 
-	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"google.golang.org/protobuf/proto"
 
 	"meshtastic_go/internal/transport"
 	"meshtastic_go/internal/ui/store"
 	"meshtastic_go/pkg/generated"
-	"meshtastic_go/pkg/serial"
 )
 
-// Constants for styling
+// Layout constants.
 const (
-	// Default width, height will be determined by terminal size
 	defaultWidth  = 120
 	defaultHeight = 40
+	statusBarH    = 1
+	inputAreaH    = 3
+	helpBarH      = 1
+	sidebarW      = 32
 )
 
-// UI area sizes
+// ---------- tea.Msg types ----------
+
+// radioEventMsg wraps a single RadioEvent received from the client.
+type radioEventMsg struct{ event transport.RadioEvent }
+
+// viewMode distinguishes channel view from DM view.
+type viewMode int
+
 const (
-	statusBarHeight = 1
-	inputAreaHeight = 3
-	sidebarWidth    = 30
+	viewChannel viewMode = iota
+	viewDM
 )
 
-// Custom messages for the tea.Model
-type (
-	// ErrorMsg represents an error that occurred
-	ErrorMsg struct{ err error }
-	// ConnectionStatusMsg updates the connection status
-	ConnectionStatusMsg string
-	// NewMessageMsg indicates a new message was received
-	NewMessageMsg store.Message
-	// NodeListUpdatedMsg indicates the node list was updated
-	NodeListUpdatedMsg []string
+// focusArea tracks which panel owns keyboard input.
+type focusArea int
+
+const (
+	focusInput   focusArea = iota // text input: Enter sends, arrows scroll viewport
+	focusSidebar                  // sidebar: Enter selects, arrows navigate list
 )
 
-// Key bindings
+// ---------- Key bindings ----------
+
 type keyMap struct {
-	Help     key.Binding
 	Quit     key.Binding
-	SendMsg  key.Binding
+	Send     key.Binding
 	NextChan key.Binding
 	PrevChan key.Binding
+	Tab      key.Binding
+	Esc      key.Binding
 }
 
-// Default key mappings
 var keys = keyMap{
-	Help: key.NewBinding(
-		key.WithKeys("?"),
-		key.WithHelp("?", "help"),
-	),
-	Quit: key.NewBinding(
-		key.WithKeys("q", "ctrl+c"),
-		key.WithHelp("q", "quit"),
-	),
-	SendMsg: key.NewBinding(
-		key.WithKeys("enter"),
-		key.WithHelp("enter", "send message"),
-	),
-	NextChan: key.NewBinding(
-		key.WithKeys("tab"),
-		key.WithHelp("tab", "next channel"),
-	),
-	PrevChan: key.NewBinding(
-		key.WithKeys("shift+tab"),
-		key.WithHelp("shift+tab", "prev channel"),
-	),
+	Quit:     key.NewBinding(key.WithKeys("ctrl+c")),
+	Send:     key.NewBinding(key.WithKeys("enter")),
+	NextChan: key.NewBinding(key.WithKeys("ctrl+n")),
+	PrevChan: key.NewBinding(key.WithKeys("ctrl+p")),
+	Tab:      key.NewBinding(key.WithKeys("tab")),
+	Esc:      key.NewBinding(key.WithKeys("esc")),
 }
 
-// ShortHelp returns keybindings to be shown in the mini help view.
-func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Help, k.Quit, k.SendMsg}
-}
+// ---------- Styles ----------
 
-// FullHelp returns keybindings for the expanded help view.
-func (k keyMap) FullHelp() [][]key.Binding {
-	return [][]key.Binding{
-		{k.Help, k.Quit},
-		{k.SendMsg, k.NextChan, k.PrevChan},
-	}
-}
-
-// Styles for UI components
 var (
-	// Base style
-	baseStyle = lipgloss.NewStyle().
-			BorderStyle(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("240"))
-
-	// Status bar style
-	statusBarStyle = lipgloss.NewStyle().
+	statusStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("252")).
-			Background(lipgloss.Color("240")).
-			Bold(true).
-			Width(defaultWidth)
+			Background(lipgloss.Color("236")).
+			Bold(true)
 
-	// Input area style
-	inputAreaStyle = baseStyle.Copy().
-			BorderTop(true).
-			BorderLeft(false).
-			BorderRight(false).
-			BorderBottom(false).
+	sidebarStyle = lipgloss.NewStyle().
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderRight(true).
+			BorderForeground(lipgloss.Color("240")).
 			Padding(0, 1)
 
-	// Message view style
-	messageViewStyle = baseStyle.Copy().
-				BorderLeft(false).
-				BorderRight(false).
-				BorderTop(false).
-				BorderBottom(false).
-				Padding(1, 2)
+	inputStyle = lipgloss.NewStyle().
+			BorderStyle(lipgloss.NormalBorder()).
+			BorderTop(true).
+			BorderForeground(lipgloss.Color("240")).
+			Padding(0, 1)
 
-	// Sidebar style
-	sidebarStyle = baseStyle.Copy().
-			BorderLeft(false).
-			BorderTop(false).
-			BorderBottom(false).
-			BorderRight(true).
-			Padding(1, 1).
-			Width(sidebarWidth)
-
-	// Message item styles
-	incomingMsgStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("99")).
-				PaddingLeft(1)
-
-	outgoingMsgStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("170")).
-				PaddingLeft(1)
-
-	systemMsgStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("243")).
-			Italic(true).
-			PaddingLeft(1)
-
-	timestampStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("241")).
-			Width(8)
-
-	senderStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("39")).
+	sidebarTitle = lipgloss.NewStyle().
 			Bold(true).
-			Width(15)
+			Foreground(lipgloss.Color("39"))
+
+	sidebarItemActive = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("229")).
+				Bold(true)
+
+	sidebarItem = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("252"))
+
+	sidebarScrollHint = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("243")).
+				Italic(true)
+
+	helpBarStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("252")).
+				Background(lipgloss.Color("238"))
+
+	helpKeyStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("229")).
+				Background(lipgloss.Color("238")).
+				Bold(true)
+
+	helpDescStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("250")).
+				Background(lipgloss.Color("238"))
+
+	helpSepStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("243")).
+				Background(lipgloss.Color("238"))
+
+	incomingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("99"))
+	outgoingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("170"))
+	systemStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Italic(true)
+	timeStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Width(9)
+	nameStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true).Width(16)
 )
 
-// Model represents the main application UI model.
+// ---------- Model ----------
+
+// Model is the Bubble Tea model for the Meshtastic TUI.
 type Model struct {
-	// Application state
-	width            int
-	height           int
-	ready            bool
-	showHelp         bool
-	err              error
-	connectionStatus string
-	activeChannelID  int
-	localNodeID      uint32
-	localNodeName    string
+	client *transport.Client
+
+	width, height int
+	ready         bool
+
+	// Messaging state
+	messageStore *store.MessageStore
+	mode         viewMode
+	channelIdx   int    // index into the channels slice for the active channel
+	dmTarget     uint32 // node num of DM target (when mode == viewDM)
+
+	// Focus & sidebar state
+	focus         focusArea // which panel owns input
+	sidebarTab    int       // 0 = channels, 1 = nodes
+	sidebarCursor int
+	sidebarOffset int // first visible item index (scroll offset)
+
+	// Cached data from client.State (refreshed on events)
+	channels []*generated.Channel
+	nodes    []*generated.NodeInfo
 
 	// UI components
-	help            help.Model
-	messageViewport viewport.Model
-	textInput       textinput.Model
-	nodeList        list.Model
-	channelList     list.Model
+	viewport  viewport.Model
+	textInput textinput.Model
 
-	// Data stores
-	messageStore *store.MessageStore
-	nodeInfo     map[uint32]string
-	channels     []*generated.Channel
-
-	// Meshtastic client
-	client     *transport.Client
-	streamConn *transport.StreamConn
+	connStatus string
 }
 
-// New creates a new Model with default values.
-func New() Model {
-	// Initialize UI components
-	help := help.New()
-	help.ShowAll = false
-
-	// Initialize text input
+// New creates a Model wired to the given connected Client.
+func New(client *transport.Client) Model {
 	ti := textinput.New()
-	ti.Placeholder = "Type your message..."
+	ti.Placeholder = "Type a message…"
 	ti.Focus()
-	ti.CharLimit = 250
-	ti.Width = defaultWidth - sidebarWidth
+	ti.CharLimit = 228 // Meshtastic max payload ~237 bytes; leave headroom
 
-	// Initialize node list
-	nodeList := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
-	nodeList.Title = "Connected Nodes"
-	nodeList.SetShowHelp(false)
+	vp := viewport.New(defaultWidth-sidebarW, defaultHeight-statusBarH-inputAreaH-helpBarH)
 
-	// Initialize channel list
-	channelList := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
-	channelList.Title = "Channels"
-
-	// Initialize viewport for message display
-	mv := viewport.New(defaultWidth-sidebarWidth, defaultHeight-statusBarHeight-inputAreaHeight)
-	mv.SetContent("")
-
-	// Initialize message store
 	ms := store.NewMessageStore()
+	ms.CreateSystemMessage("Welcome to Meshtastic Go!")
 
-	// Add a welcome message
-	ms.CreateSystemMessage("Welcome to Meshtastic Go Messenger!")
-	ms.CreateSystemMessage("Searching for Meshtastic devices...")
+	// Snapshot initial state — filter out disabled channels.
+	channels := filterActiveChannels(client.State.Channels())
+	nodes := client.State.Nodes()
+	sortNodes(nodes)
 
 	return Model{
-		// Set default values
-		width:            defaultWidth,
-		height:           defaultHeight,
-		ready:            false,
-		showHelp:         false,
-		connectionStatus: "Disconnected",
-		activeChannelID:  0, // Default channel
-
-		// Initialize components
-		help:            help,
-		messageViewport: mv,
-		textInput:       ti,
-		nodeList:        nodeList,
-		channelList:     channelList,
-
-		// Initialize stores
+		client:       client,
+		width:        defaultWidth,
+		height:       defaultHeight,
 		messageStore: ms,
-		nodeInfo:     make(map[uint32]string),
-		channels:     make([]*generated.Channel, 0),
+		mode:         viewChannel,
+		channels:     channels,
+		nodes:        nodes,
+		viewport:     vp,
+		textInput:    ti,
+		connStatus:   "Connected",
 	}
 }
 
-// Init initializes the model and returns commands to run.
+// Init returns the initial command — start listening for radio events.
 func (m Model) Init() tea.Cmd {
-	// Add commands to run at startup
-	return tea.Batch(
-		// Start device detection and connection in background
-		m.detectAndConnectCmd(),
-		// Set up a ticker for periodic UI updates
-		tea.Tick(time.Second, func(t time.Time) tea.Msg {
-			return tea.Tick(time.Second, func(time.Time) tea.Msg { return nil })
-		}),
-	)
+	return m.listenForEvent()
 }
 
-// detectAndConnectCmd creates a command that attempts to detect and connect to Meshtastic devices.
-func (m Model) detectAndConnectCmd() tea.Cmd {
+// listenForEvent returns a tea.Cmd that blocks on client.Events and
+// wraps the next event as a radioEventMsg.
+func (m Model) listenForEvent() tea.Cmd {
 	return func() tea.Msg {
-		// Detect available ports
-		ports := serial.GetPorts()
-		if len(ports) == 0 {
-			return ErrorMsg{fmt.Errorf("no Meshtastic devices found")}
+		ev, ok := <-m.client.Events
+		if !ok {
+			// Channel closed — radio disconnected.
+			return radioEventMsg{event: transport.ConnectionEvent{
+				Status:  transport.StatusDisconnected,
+				Message: "Radio connection closed",
+			}}
 		}
-
-		// Use the first port
-		port := ports[0]
-		streamPort, err := serial.Connect(port)
-		if err != nil {
-			return ErrorMsg{fmt.Errorf("failed to connect to device on %s: %v", port, err)}
-		}
-
-		// Create stream connection and client
-		streamConn := transport.NewRadioStreamConn(streamPort)
-		client := transport.NewClient(streamConn, false)
-
-		// Register message handler
-		client.Handle(&generated.MeshPacket{}, func(msg proto.Message) {
-			if packet, ok := msg.(*generated.MeshPacket); ok {
-				// Process the received message and add it to the message store
-				m.messageStore.AddFromMeshPacket(packet, m.nodeInfo)
-			}
-		})
-
-		// Connect to the device
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		if err := client.Connect(ctx); err != nil {
-			return ErrorMsg{fmt.Errorf("failed to establish connection: %v", err)}
-		}
-
-		// Update local node info
-		if info := client.State.NodeInfo(); info != nil {
-			m.localNodeID = info.MyNodeNum
-
-			// Try to get a user-friendly name from the device metadata
-			if meta := client.State.DeviceMetadata(); meta != nil {
-				// Use firmware version as our display name
-				m.localNodeName = meta.FirmwareVersion
-
-				// Check if we can get node info from the state
-				nodeInfos := client.State.Nodes()
-				for _, node := range nodeInfos {
-					if node.Num == m.localNodeID && node.User != nil && node.User.LongName != "" {
-						// Use the user's long name if available
-						m.localNodeName = node.User.LongName
-						break
-					}
-				}
-			} else {
-				// Fallback to a node ID if no metadata is available
-				m.localNodeName = fmt.Sprintf("Local-%d", m.localNodeID)
-			}
-		}
-
-		// Update channel info
-		m.channels = client.State.Channels()
-
-		// Store client and connection for later use
-		m.client = client
-		m.streamConn = streamConn
-
-		// Update node list
-		var nodeItems []list.Item
-		for id, name := range m.nodeInfo {
-			nodeItems = append(nodeItems, nodeListItem{id: id, name: name})
-		}
-		m.nodeList.SetItems(nodeItems)
-
-		// Return connection status message
-		return ConnectionStatusMsg("Connected to " + port)
+		return radioEventMsg{event: ev}
 	}
 }
 
-// Update handles events and updates the model accordingly.
+// ---------- Update ----------
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var (
-		cmd  tea.Cmd
-		cmds []tea.Cmd
-	)
+	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch {
-		case key.Matches(msg, keys.Quit):
-			return m, tea.Quit
-
-		case key.Matches(msg, keys.Help):
-			m.showHelp = !m.showHelp
-
-		case key.Matches(msg, keys.SendMsg):
-			if m.client != nil && m.textInput.Value() != "" {
-				// Create and send the message
-				content := m.textInput.Value()
-				m.messageStore.CreateOutgoingMessage(
-					content,
-					0xFFFFFFFF, // Broadcast to all
-					m.activeChannelID,
-					m.localNodeID,
-					m.localNodeName,
-				)
-
-				// TODO: Implement the actual sending through the Meshtastic client
-				// This will be done in a separate function
-
-				// Clear the input
-				m.textInput.SetValue("")
-
-				// Update the message viewport with the new message
-				cmd = m.updateMessageViewCmd()
-				cmds = append(cmds, cmd)
-			}
-
-		case key.Matches(msg, keys.NextChan):
-			// Change to next channel if available
-			if len(m.channels) > 0 {
-				m.activeChannelID = (m.activeChannelID + 1) % len(m.channels)
-				cmd = m.updateMessageViewCmd()
-				cmds = append(cmds, cmd)
-			}
-
-		case key.Matches(msg, keys.PrevChan):
-			// Change to previous channel if available
-			if len(m.channels) > 0 {
-				m.activeChannelID = (m.activeChannelID - 1 + len(m.channels)) % len(m.channels)
-				cmd = m.updateMessageViewCmd()
-				cmds = append(cmds, cmd)
-			}
-		}
 
 	case tea.WindowSizeMsg:
-		// Update the model's window size
 		m.width = msg.Width
 		m.height = msg.Height
-
-		// Adjust viewport and other component sizes
-		headerHeight := statusBarHeight
-		footerHeight := inputAreaHeight
-		viewportHeight := m.height - headerHeight - footerHeight
-
-		m.messageViewport.Width = m.width - sidebarWidth
-		m.messageViewport.Height = viewportHeight
-
-		// Update the status bar width
-		statusBarStyle = statusBarStyle.Width(m.width)
-
-		// Update the text input width
-		m.textInput.Width = m.width - sidebarWidth - 4
-
-		// Update the node list dimensions
-		m.nodeList.SetSize(sidebarWidth, m.height-headerHeight)
-
-		// Mark as ready to render with correct dimensions
+		m.viewport.Width = m.width - sidebarW
+		m.viewport.Height = m.height - statusBarH - inputAreaH - helpBarH
+		m.textInput.Width = m.width - sidebarW - 4
 		m.ready = true
+		m.refreshMessages()
 
-		// Update the message viewport content
-		cmd = m.updateMessageViewCmd()
-		cmds = append(cmds, cmd)
+	case radioEventMsg:
+		m.handleRadioEvent(msg.event)
+		m.refreshMessages()
+		cmds = append(cmds, m.listenForEvent())
 
-	case ErrorMsg:
-		// Update the error state
-		m.err = msg.err
-		// Add an error message to the message store
-		m.messageStore.CreateSystemMessage(fmt.Sprintf("Error: %v", msg.err))
-		// Update the message viewport
-		cmd = m.updateMessageViewCmd()
-		cmds = append(cmds, cmd)
-
-	case ConnectionStatusMsg:
-		// Update the connection status
-		m.connectionStatus = string(msg)
-		// Add a system message about the connection
-		m.messageStore.CreateSystemMessage(fmt.Sprintf("Connection status: %s", msg))
-		// Update the message viewport
-		cmd = m.updateMessageViewCmd()
-		cmds = append(cmds, cmd)
-
-	case NewMessageMsg:
-		// New message received, update the message viewport
-		cmd = m.updateMessageViewCmd()
-		cmds = append(cmds, cmd)
-
-	case NodeListUpdatedMsg:
-		// Update the node list items
-		var items []list.Item
-		for _, name := range msg {
-			items = append(items, nodeListItem{name: name})
+	case tea.KeyMsg:
+		cmd := m.handleKey(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
 		}
-		m.nodeList.SetItems(items)
+		// Only forward key events to the component that has focus.
+		if m.focus == focusInput {
+			var tiCmd tea.Cmd
+			m.textInput, tiCmd = m.textInput.Update(msg)
+			cmds = append(cmds, tiCmd)
+		}
+		// Viewport scrolls only when input is focused (not when sidebar navigates).
+		if m.focus == focusInput {
+			var vpCmd tea.Cmd
+			m.viewport, vpCmd = m.viewport.Update(msg)
+			cmds = append(cmds, vpCmd)
+		}
+		return m, tea.Batch(cmds...)
+
+	default:
+		// Non-key messages (window size, etc.) go to all components.
+		var tiCmd tea.Cmd
+		m.textInput, tiCmd = m.textInput.Update(msg)
+		cmds = append(cmds, tiCmd)
+		var vpCmd tea.Cmd
+		m.viewport, vpCmd = m.viewport.Update(msg)
+		cmds = append(cmds, vpCmd)
 	}
-
-	// Update child components
-	var textInputCmd tea.Cmd
-	m.textInput, textInputCmd = m.textInput.Update(msg)
-	cmds = append(cmds, textInputCmd)
-
-	var viewportCmd tea.Cmd
-	m.messageViewport, viewportCmd = m.messageViewport.Update(msg)
-	cmds = append(cmds, viewportCmd)
-
-	var nodeListCmd tea.Cmd
-	m.nodeList, nodeListCmd = m.nodeList.Update(msg)
-	cmds = append(cmds, nodeListCmd)
 
 	return m, tea.Batch(cmds...)
 }
 
-// View renders the UI.
-func (m Model) View() string {
-	if !m.ready {
-		return "Initializing..."
-	}
-
-	// Build the status bar
-	var channelInfo string
-	if len(m.channels) > 0 && m.activeChannelID < len(m.channels) {
-		if m.channels[m.activeChannelID].Settings != nil {
-			channelInfo = m.channels[m.activeChannelID].Settings.Name
-		} else {
-			channelInfo = fmt.Sprintf("Ch%d", m.activeChannelID)
+// handleRadioEvent processes a single RadioEvent and updates model state.
+func (m *Model) handleRadioEvent(ev transport.RadioEvent) {
+	switch e := ev.(type) {
+	case transport.TextMessageEvent:
+		m.messageStore.CreateIncomingMessage(
+			e.Content, e.From, e.SenderName, e.To, e.Channel, e.Timestamp,
+		)
+	case transport.NodeUpdateEvent:
+		m.nodes = m.client.State.Nodes()
+		sortNodes(m.nodes)
+	case transport.ConnectionEvent:
+		m.connStatus = e.Status.String()
+		if e.Message != "" {
+			m.messageStore.CreateSystemMessage(e.Message)
 		}
-	} else {
-		channelInfo = "Default"
+	case transport.TelemetryEvent:
+		m.nodes = m.client.State.Nodes()
+		sortNodes(m.nodes)
+	case transport.PositionEvent:
+		m.nodes = m.client.State.Nodes()
+		sortNodes(m.nodes)
 	}
-	statusBar := statusBarStyle.Render(fmt.Sprintf(" Status: %s | Channel: %s | Nodes: %d ",
-		m.connectionStatus,
-		channelInfo,
-		len(m.nodeInfo),
-	))
-
-	// Render the help text if it's enabled
-	var helpView string
-	if m.showHelp {
-		helpView = m.help.View(keys)
-	}
-
-	// Determine the active panel
-	messagePanelContent := m.messageViewport.View()
-	messagePanel := messageViewStyle.Height(m.messageViewport.Height).Width(m.width - sidebarWidth).Render(messagePanelContent)
-
-	// Render the input area
-	inputArea := inputAreaStyle.Width(m.width - sidebarWidth).Render(m.textInput.View())
-
-	// Render the sidebar with node list
-	sidebar := sidebarStyle.Height(m.height - statusBarHeight).Render(m.nodeList.View())
-
-	// Combine the status bar, viewport, sidebar, and input area
-	mainContent := lipgloss.JoinVertical(
-		lipgloss.Left,
-		messagePanel,
-		inputArea,
-	)
-
-	// Join sidebar and main content horizontally
-	content := lipgloss.JoinHorizontal(
-		lipgloss.Top,
-		sidebar,
-		mainContent,
-	)
-
-	// Combine everything
-	return lipgloss.JoinVertical(
-		lipgloss.Left,
-		statusBar,
-		content,
-		helpView,
-	)
 }
 
-// updateMessageViewCmd creates a command to update the message viewport with current messages.
-func (m Model) updateMessageViewCmd() tea.Cmd {
-	return func() tea.Msg {
-		// Get all messages or filter by active channel, if needed
-		messages := m.messageStore.GetAllMessages()
-
-		// Format the messages for display
-		var formattedMessages []string
-		for _, msg := range messages {
-			formattedMsg := formatMessage(msg)
-			formattedMessages = append(formattedMessages, formattedMsg)
+// handleKey processes a key press and returns an optional command.
+func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
+	// Global keys — work in any focus state.
+	switch {
+	case key.Matches(msg, keys.Quit):
+		return tea.Quit
+	case key.Matches(msg, keys.Tab):
+		m.toggleFocus()
+		return nil
+	case key.Matches(msg, keys.NextChan):
+		if len(m.channels) > 0 {
+			m.channelIdx = (m.channelIdx + 1) % len(m.channels)
+			m.mode = viewChannel
+			m.refreshMessages()
 		}
-
-		// Join the formatted messages into a single string
-		content := strings.Join(formattedMessages, "\n")
-
-		// Set the content of the viewport
-		m.messageViewport.SetContent(content)
-
-		// Scroll to the bottom to see newest messages
-		m.messageViewport.GotoBottom()
-
+		return nil
+	case key.Matches(msg, keys.PrevChan):
+		if len(m.channels) > 0 {
+			m.channelIdx = (m.channelIdx - 1 + len(m.channels)) % len(m.channels)
+			m.mode = viewChannel
+			m.refreshMessages()
+		}
 		return nil
 	}
+
+	// Focus-specific keys.
+	switch m.focus {
+	case focusSidebar:
+		return m.handleSidebarKey(msg)
+	case focusInput:
+		return m.handleInputKey(msg)
+	}
+	return nil
 }
 
-// formatMessage formats a message for display in the viewport.
+// handleSidebarKey handles keys when the sidebar has focus.
+func (m *Model) handleSidebarKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.Type {
+	case tea.KeyUp:
+		if m.sidebarCursor > 0 {
+			m.sidebarCursor--
+			m.ensureSidebarCursorVisible()
+		}
+	case tea.KeyDown:
+		max := m.sidebarListLen() - 1
+		if max < 0 {
+			max = 0
+		}
+		if m.sidebarCursor < max {
+			m.sidebarCursor++
+			m.ensureSidebarCursorVisible()
+		}
+	case tea.KeyLeft, tea.KeyRight:
+		// Switch between channels tab and nodes tab.
+		m.sidebarTab = (m.sidebarTab + 1) % 2
+		m.sidebarCursor = 0
+		m.sidebarOffset = 0
+	case tea.KeyEnter:
+		m.selectSidebarItem()
+	case tea.KeyEscape:
+		m.focus = focusInput
+		m.textInput.Focus()
+		m.mode = viewChannel
+		m.refreshMessages()
+	default:
+		// Any printable character → switch to input and let it be typed.
+		if msg.Type == tea.KeyRunes {
+			m.focus = focusInput
+			m.textInput.Focus()
+		}
+	}
+	return nil
+}
+
+// handleInputKey handles keys when the text input has focus.
+func (m *Model) handleInputKey(msg tea.KeyMsg) tea.Cmd {
+	switch {
+	case key.Matches(msg, keys.Send):
+		return m.sendMessage()
+	case key.Matches(msg, keys.Esc):
+		if m.mode == viewDM {
+			m.mode = viewChannel
+			m.refreshMessages()
+		}
+	}
+	return nil
+}
+
+// toggleFocus switches between sidebar and text input focus.
+func (m *Model) toggleFocus() {
+	if m.focus == focusInput {
+		m.focus = focusSidebar
+		m.textInput.Blur()
+	} else {
+		m.focus = focusInput
+		m.textInput.Focus()
+	}
+}
+
+// selectSidebarItem activates the currently highlighted sidebar item.
+func (m *Model) selectSidebarItem() {
+	if m.sidebarTab == 0 {
+		// Channels tab: switch active channel.
+		if m.sidebarCursor < len(m.channels) {
+			m.channelIdx = m.sidebarCursor
+			m.mode = viewChannel
+			m.refreshMessages()
+		}
+	} else {
+		// Nodes tab: start DM with selected node.
+		if m.sidebarCursor < len(m.nodes) {
+			m.dmTarget = m.nodes[m.sidebarCursor].Num
+			m.mode = viewDM
+			m.refreshMessages()
+		}
+	}
+	// Return focus to input after selection.
+	m.focus = focusInput
+	m.textInput.Focus()
+}
+
+// sendMessage sends the current text input content via the client.
+func (m *Model) sendMessage() tea.Cmd {
+	content := strings.TrimSpace(m.textInput.Value())
+	if content == "" {
+		return nil
+	}
+
+	var to uint32
+	var chIdx uint32
+	switch m.mode {
+	case viewChannel:
+		to = store.BroadcastAddr
+		chIdx = m.activeChannelIndex()
+	case viewDM:
+		to = m.dmTarget
+		chIdx = 0 // DMs go on primary channel
+	}
+
+	m.messageStore.CreateOutgoingMessage(
+		content, to, chIdx, m.client.MyNodeNum(), m.client.LocalNodeName(),
+	)
+
+	// Actually transmit over the radio.
+	if err := m.client.SendText(to, chIdx, content); err != nil {
+		m.messageStore.CreateSystemMessage(fmt.Sprintf("Send failed: %v", err))
+	}
+
+	m.textInput.SetValue("")
+	m.refreshMessages()
+	return nil
+}
+
+// ---------- View ----------
+
+func (m Model) View() string {
+	if !m.ready {
+		return "Connecting to Meshtastic device…"
+	}
+
+	// Status bar
+	targetLabel := m.targetLabel()
+	nodeCount := len(m.nodes)
+	statusText := fmt.Sprintf(" %s │ %s │ %s │ Nodes: %d ",
+		m.connStatus, m.client.LocalNodeName(), targetLabel, nodeCount)
+	statusBar := statusStyle.Width(m.width).Render(statusText)
+
+	// Sidebar
+	sidebar := m.renderSidebar()
+
+	// Message viewport
+	mainPanel := m.viewport.View()
+
+	// Input
+	inputBar := inputStyle.Width(m.width - sidebarW).Render(m.textInput.View())
+
+	// Compose
+	rightCol := lipgloss.JoinVertical(lipgloss.Left, mainPanel, inputBar)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, rightCol)
+
+	// Persistent help bar
+	helpBar := m.renderHelpBar()
+
+	return lipgloss.JoinVertical(lipgloss.Left, statusBar, body, helpBar)
+}
+
+// ---------- Sidebar rendering ----------
+
+func (m Model) renderSidebar() string {
+	// Exact body height: everything between status bar and help bar.
+	bodyH := m.height - statusBarH - helpBarH
+	if bodyH < 3 {
+		bodyH = 3
+	}
+
+	// Content width = sidebar total width minus frame (borders + padding).
+	// Each line MUST fit within this to prevent wrapping.
+	contentW := sidebarW - sidebarStyle.GetHorizontalFrameSize()
+	if contentW < 10 {
+		contentW = 10
+	}
+
+	isSidebarFocused := m.focus == focusSidebar
+
+	// Build list of items.
+	type sidebarEntry struct {
+		text string
+		high bool
+	}
+
+	var header string
+	var items []sidebarEntry
+
+	if m.sidebarTab == 0 {
+		if isSidebarFocused {
+			header = "Channels [←→ Nodes]"
+		} else {
+			header = "Channels"
+		}
+		for i, ch := range m.channels {
+			name := channelDisplayName(ch)
+			active := i == m.channelIdx && m.mode == viewChannel
+			cursored := isSidebarFocused && i == m.sidebarCursor
+			prefix := "  "
+			if cursored {
+				prefix = "► "
+			} else if active {
+				prefix = "● "
+			}
+			items = append(items, sidebarEntry{prefix + name, cursored || active})
+		}
+	} else {
+		if isSidebarFocused {
+			header = "Nodes [←→ Channels]"
+		} else {
+			header = "Nodes"
+		}
+		for i, n := range m.nodes {
+			name := nodeDisplayName(n)
+			cursored := isSidebarFocused && i == m.sidebarCursor
+			dmActive := m.mode == viewDM && n.Num == m.dmTarget
+			prefix := "  "
+			if cursored {
+				prefix = "► "
+			} else if dmActive {
+				prefix = "● "
+			}
+			items = append(items, sidebarEntry{prefix + name, cursored || dmActive})
+		}
+	}
+
+	// Build output as an exact slice of `bodyH` lines.
+	// Every line is truncated to contentW to prevent wrapping.
+	lines := make([]string, 0, bodyH)
+
+	// Line 0: title (truncated).
+	lines = append(lines, sidebarTitle.MaxWidth(contentW).Render(header))
+
+	// Remaining lines for items + scroll indicators.
+	itemSlots := bodyH - len(lines)
+	if itemSlots < 1 {
+		itemSlots = 1
+	}
+
+	total := len(items)
+	offset := m.sidebarOffset
+
+	// Determine scroll indicators and item capacity.
+	hasAbove := offset > 0
+	hasBelow := offset+itemSlots < total
+	listCap := itemSlots
+	if hasAbove {
+		listCap--
+	}
+	if hasBelow {
+		listCap--
+	}
+	if listCap < 1 {
+		listCap = 1
+	}
+
+	// ▲ indicator.
+	if hasAbove {
+		lines = append(lines, sidebarScrollHint.MaxWidth(contentW).Render(fmt.Sprintf("  ▲ %d more", offset)))
+	}
+
+	// Visible items — each truncated to contentW.
+	end := offset + listCap
+	if end > total {
+		end = total
+	}
+	for i := offset; i < end; i++ {
+		e := items[i]
+		if e.high {
+			lines = append(lines, sidebarItemActive.MaxWidth(contentW).Render(e.text))
+		} else {
+			lines = append(lines, sidebarItem.MaxWidth(contentW).Render(e.text))
+		}
+	}
+
+	// ▼ indicator.
+	if hasBelow {
+		remaining := total - end
+		lines = append(lines, sidebarScrollHint.MaxWidth(contentW).Render(fmt.Sprintf("  ▼ %d more", remaining)))
+	}
+
+	// Pad to exactly bodyH lines so sidebar never overflows or underflows.
+	for len(lines) < bodyH {
+		lines = append(lines, "")
+	}
+	if len(lines) > bodyH {
+		lines = lines[:bodyH]
+	}
+
+	content := strings.Join(lines, "\n")
+	return sidebarStyle.Width(sidebarW).Render(content)
+}
+
+func (m Model) sidebarListLen() int {
+	if m.sidebarTab == 0 {
+		return len(m.channels)
+	}
+	return len(m.nodes)
+}
+
+// sidebarItemCapacity returns how many list items fit in the sidebar,
+// accounting for the title line. This is the raw capacity before
+// subtracting scroll indicator lines.
+func (m Model) sidebarItemCapacity() int {
+	bodyH := m.height - statusBarH - helpBarH
+	const titleLines = 1 // header only, no padding
+	v := bodyH - titleLines
+	if v < 1 {
+		v = 1
+	}
+	return v
+}
+
+// ensureSidebarCursorVisible adjusts sidebarOffset so the cursor is in view.
+func (m *Model) ensureSidebarCursorVisible() {
+	itemSlots := m.sidebarItemCapacity()
+	// Account for scroll indicators taking a line each.
+	if m.sidebarOffset > 0 {
+		itemSlots--
+	}
+	total := m.sidebarListLen()
+	if m.sidebarOffset+itemSlots < total {
+		itemSlots--
+	}
+	if itemSlots < 1 {
+		itemSlots = 1
+	}
+
+	// Scroll down if cursor is below the visible window.
+	if m.sidebarCursor >= m.sidebarOffset+itemSlots {
+		m.sidebarOffset = m.sidebarCursor - itemSlots + 1
+	}
+	// Scroll up if cursor is above the visible window.
+	if m.sidebarCursor < m.sidebarOffset {
+		m.sidebarOffset = m.sidebarCursor
+	}
+	if m.sidebarOffset < 0 {
+		m.sidebarOffset = 0
+	}
+}
+
+// ---------- Help bar ----------
+
+// helpEntry is a key/description pair for the help bar.
+type helpEntry struct {
+	key  string
+	desc string
+}
+
+// renderHelpBar returns a styled, context-sensitive help bar.
+func (m Model) renderHelpBar() string {
+	var entries []helpEntry
+
+	switch m.focus {
+	case focusInput:
+		entries = append(entries, helpEntry{"Tab", "sidebar"})
+		entries = append(entries, helpEntry{"Enter", "send"})
+		entries = append(entries, helpEntry{"Ctrl+N/P", "channels"})
+		if m.mode == viewDM {
+			entries = append(entries, helpEntry{"Esc", "back to channel"})
+		}
+	case focusSidebar:
+		entries = append(entries, helpEntry{"↑↓", "navigate"})
+		if m.sidebarTab == 0 {
+			entries = append(entries, helpEntry{"←→", "nodes"})
+			entries = append(entries, helpEntry{"Enter", "switch channel"})
+		} else {
+			entries = append(entries, helpEntry{"←→", "channels"})
+			entries = append(entries, helpEntry{"Enter", "direct message"})
+		}
+		entries = append(entries, helpEntry{"Tab", "input"})
+		entries = append(entries, helpEntry{"Esc", "back"})
+	}
+	entries = append(entries, helpEntry{"Ctrl+C", "quit"})
+
+	sep := helpSepStyle.Render(" │ ")
+	var parts []string
+	for _, e := range entries {
+		parts = append(parts, helpKeyStyle.Render(e.key)+" "+helpDescStyle.Render(e.desc))
+	}
+
+	line := " " + strings.Join(parts, sep) + " "
+	return helpBarStyle.Width(m.width).Render(line)
+}
+
+// ---------- Message rendering ----------
+
+// refreshMessages re-renders the viewport content based on the active view.
+func (m *Model) refreshMessages() {
+	var msgs []store.Message
+	switch m.mode {
+	case viewChannel:
+		msgs = m.messageStore.GetMessagesByChannel(m.activeChannelIndex())
+	case viewDM:
+		msgs = m.messageStore.GetMessagesByConversation(m.client.MyNodeNum(), m.dmTarget)
+	}
+
+	var lines []string
+	for _, msg := range msgs {
+		lines = append(lines, formatMessage(msg))
+	}
+
+	m.viewport.SetContent(strings.Join(lines, "\n"))
+	m.viewport.GotoBottom()
+}
+
 func formatMessage(msg store.Message) string {
-	// Format timestamp
-	timestamp := timestampStyle.Render(msg.Timestamp.Format("15:04:05"))
+	ts := timeStyle.Render(msg.Timestamp.Format("15:04:05"))
+	sender := nameStyle.Render(msg.SenderName)
 
-	// Format sender
-	sender := senderStyle.Render(msg.SenderName)
-
-	// Format message based on type
-	var formattedContent string
+	var body string
 	switch msg.Type {
 	case store.MessageTypeIncoming:
-		formattedContent = incomingMsgStyle.Render(msg.Content)
+		body = incomingStyle.Render(msg.Content)
 	case store.MessageTypeOutgoing:
-		formattedContent = outgoingMsgStyle.Render(msg.Content)
+		body = outgoingStyle.Render(msg.Content)
 	case store.MessageTypeSystem:
-		formattedContent = systemMsgStyle.Render(msg.Content)
+		return systemStyle.Render(fmt.Sprintf("%s  %s", ts, msg.Content))
 	}
-
-	// Combine all parts
-	return fmt.Sprintf("%s %s: %s", timestamp, sender, formattedContent)
+	return fmt.Sprintf("%s %s %s", ts, sender, body)
 }
 
-// nodeListItem implements list.Item for the node list.
-type nodeListItem struct {
-	id   uint32
-	name string
-}
+// ---------- Helpers ----------
 
-// FilterValue implements list.Item.
-func (n nodeListItem) FilterValue() string {
-	return n.name
-}
-
-// Title implements list.Item.
-func (n nodeListItem) Title() string {
-	return n.name
-}
-
-// Description implements list.Item.
-func (n nodeListItem) Description() string {
-	return fmt.Sprintf("ID: %d", n.id)
-}
-
-// NodeItem represents a node in the list
-type NodeItem struct {
-	Name string
-}
-
-// FilterValue implements list.Item
-func (n NodeItem) FilterValue() string {
-	return n.Name
-}
-
-// Title implements list.Item
-func (n NodeItem) Title() string {
-	return n.Name
-}
-
-// Description implements list.Item
-func (n NodeItem) Description() string {
-	return "Connected Node"
-}
-
-// ChannelItem represents a channel in the list
-type ChannelItem struct {
-	Name string
-}
-
-// FilterValue implements list.Item
-func (c ChannelItem) FilterValue() string {
-	return c.Name
-}
-
-// Title implements list.Item
-func (c ChannelItem) Title() string {
-	return c.Name
-}
-
-// Description implements list.Item
-func (c ChannelItem) Description() string {
-	return "Channel"
-}
-
-// UpdateNodes updates the node list in the TUI
-func (m *Model) UpdateNodes(nodes []string) {
-	items := make([]list.Item, len(nodes))
-	for i, node := range nodes {
-		items[i] = NodeItem{Name: node}
+func (m Model) activeChannelIndex() uint32 {
+	if m.channelIdx < 0 || m.channelIdx >= len(m.channels) {
+		return 0
 	}
-	m.nodeList.SetItems(items)
+	return uint32(m.channels[m.channelIdx].Index)
 }
 
-// UpdateChannels updates the channel list in the TUI
-func (m *Model) UpdateChannels(channels []string) {
-	items := make([]list.Item, len(channels))
-	for i, channel := range channels {
-		items[i] = ChannelItem{Name: channel}
+func (m Model) targetLabel() string {
+	switch m.mode {
+	case viewDM:
+		return "DM: " + m.client.NodeName(m.dmTarget)
+	default:
+		if len(m.channels) > 0 && m.channelIdx < len(m.channels) {
+			return "Ch: " + channelDisplayName(m.channels[m.channelIdx])
+		}
+		return "Ch: Primary"
 	}
-	m.channelList.SetItems(items)
+}
+
+func channelDisplayName(ch *generated.Channel) string {
+	if ch.Settings != nil && ch.Settings.Name != "" {
+		return ch.Settings.Name
+	}
+	if ch.Role == generated.Channel_PRIMARY {
+		return "Primary"
+	}
+	return fmt.Sprintf("Ch%d", ch.Index)
+}
+
+func nodeDisplayName(n *generated.NodeInfo) string {
+	name := store.FormatNodeID(n.Num)
+	if n.User != nil && n.User.LongName != "" {
+		name = n.User.LongName
+	}
+	if n.HopsAway > 0 {
+		name += fmt.Sprintf(" (%d hop)", n.HopsAway)
+	}
+	return name
+}
+
+// filterActiveChannels removes DISABLED channels from the list.
+func filterActiveChannels(all []*generated.Channel) []*generated.Channel {
+	var out []*generated.Channel
+	for _, ch := range all {
+		if ch.Role != generated.Channel_DISABLED {
+			out = append(out, ch)
+		}
+	}
+	return out
+}
+
+// sortNodes sorts nodes by last heard (most recent first), then by name A-Z.
+func sortNodes(nodes []*generated.NodeInfo) {
+	sort.Slice(nodes, func(i, j int) bool {
+		// Most recently heard first.
+		if nodes[i].LastHeard != nodes[j].LastHeard {
+			return nodes[i].LastHeard > nodes[j].LastHeard
+		}
+		// Tie-break: alphabetical by display name.
+		return nodeDisplayName(nodes[i]) < nodeDisplayName(nodes[j])
+	})
 }
