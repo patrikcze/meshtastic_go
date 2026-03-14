@@ -11,6 +11,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: ubuntu-latest
@@ -21,7 +22,6 @@ jobs:
             goos: linux
             goarch: arm
             suffix: linux_arm
-            cross_arm: true
           - runner: macos-latest
             goos: darwin
             goarch: arm64
@@ -44,13 +44,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install ARM cross-compiler
-        if: matrix.cross_arm
-        run: |
-          sudo dpkg --add-architecture armhf
-          sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
-
       - name: Build
         shell: bash
         env:
@@ -58,13 +51,6 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           VERSION="${GITHUB_REF_NAME}"
-
-          # ARM cross-compilation needs explicit CGo + cross-compiler.
-          if [ "${{ matrix.cross_arm }}" = "true" ]; then
-            export CC=arm-linux-gnueabihf-gcc
-            export CGO_ENABLED=1
-          fi
-
           mkdir -p bin
           go build \
             -o "bin/meshtastic_go_${{ matrix.suffix }}" \
