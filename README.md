@@ -6,6 +6,8 @@ Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) and protobuf
 
 ## Features
 
+- **Plan add more features** - Some basic stuff only
+
 - **Channel messaging** — send and receive on any configured channel
 - **Direct messages** — DM any node in the mesh
 - **Live node list** — scrollable, sorted by last heard, with hop count
