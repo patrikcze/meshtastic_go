@@ -6,11 +6,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tui "github.com/gizak/termui/v3"
+	"github.com/gizak/termui/v3/widgets"
 
 	"meshtastic_go/internal/transport"
 	"meshtastic_go/internal/ui/store"
@@ -19,18 +16,12 @@ import (
 
 // Layout constants.
 const (
-	defaultWidth  = 120
-	defaultHeight = 40
-	statusBarH    = 1
-	inputAreaH    = 3
-	helpBarH      = 1
-	sidebarW      = 32
+	sidebarW    = 32
+	inputH      = 3
+	statusH     = 1
+	helpH       = 1
+	maxInputLen = 228 // Meshtastic max payload ~237 bytes; leave headroom.
 )
-
-// ---------- tea.Msg types ----------
-
-// radioEventMsg wraps a single RadioEvent received from the client.
-type radioEventMsg struct{ event transport.RadioEvent }
 
 // viewMode distinguishes channel view from DM view.
 type viewMode int
@@ -44,521 +35,263 @@ const (
 type focusArea int
 
 const (
-	focusInput   focusArea = iota // text input: Enter sends, arrows scroll viewport
-	focusSidebar                  // sidebar: Enter selects, arrows navigate list
+	focusInput   focusArea = iota // text input: typing, Enter sends
+	focusSidebar                  // sidebar: arrows navigate, Enter selects
 )
 
-// ---------- Key bindings ----------
-
-type keyMap struct {
-	Quit     key.Binding
-	Send     key.Binding
-	NextChan key.Binding
-	PrevChan key.Binding
-	Tab      key.Binding
-	Esc      key.Binding
-}
-
-var keys = keyMap{
-	Quit:     key.NewBinding(key.WithKeys("ctrl+c")),
-	Send:     key.NewBinding(key.WithKeys("enter")),
-	NextChan: key.NewBinding(key.WithKeys("ctrl+n")),
-	PrevChan: key.NewBinding(key.WithKeys("ctrl+p")),
-	Tab:      key.NewBinding(key.WithKeys("tab")),
-	Esc:      key.NewBinding(key.WithKeys("esc")),
-}
-
-// ---------- Styles ----------
-
-var (
-	statusStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("252")).
-			Background(lipgloss.Color("236")).
-			Bold(true)
-
-	sidebarStyle = lipgloss.NewStyle().
-			BorderStyle(lipgloss.NormalBorder()).
-			BorderRight(true).
-			BorderForeground(lipgloss.Color("240")).
-			Padding(0, 1)
-
-	inputStyle = lipgloss.NewStyle().
-			BorderStyle(lipgloss.NormalBorder()).
-			BorderTop(true).
-			BorderForeground(lipgloss.Color("240")).
-			Padding(0, 1)
-
-	sidebarTitle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("39"))
-
-	sidebarItemActive = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("229")).
-				Bold(true)
-
-	sidebarItem = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("252"))
-
-	sidebarScrollHint = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("243")).
-				Italic(true)
-
-	helpBarStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("252")).
-				Background(lipgloss.Color("238"))
-
-	helpKeyStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("229")).
-				Background(lipgloss.Color("238")).
-				Bold(true)
-
-	helpDescStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("250")).
-				Background(lipgloss.Color("238"))
-
-	helpSepStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("243")).
-				Background(lipgloss.Color("238"))
-
-	incomingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("99"))
-	outgoingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("170"))
-	systemStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Italic(true)
-	timeStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Width(9)
-	nameStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Bold(true).Width(16)
-)
-
-// ---------- Model ----------
-
-// Model is the Bubble Tea model for the Meshtastic TUI.
-type Model struct {
+// App is the main TUI application.
+type App struct {
 	client *transport.Client
 
 	width, height int
-	ready         bool
+	sideW         int // effective sidebar width after layout
 
 	// Messaging state
 	messageStore *store.MessageStore
 	mode         viewMode
 	channelIdx   int    // index into the channels slice for the active channel
-	dmTarget     uint32 // node num of DM target (when mode == viewDM)
+	dmTarget     uint32 // node number of DM peer (when mode == viewDM)
 
 	// Focus & sidebar state
-	focus         focusArea // which panel owns input
-	sidebarTab    int       // 0 = channels, 1 = nodes
+	focus         focusArea
+	sidebarTab    int // 0 = channels, 1 = nodes
 	sidebarCursor int
-	sidebarOffset int // first visible item index (scroll offset)
+	sidebarOffset int // first visible item index
 
 	// Cached data from client.State (refreshed on events)
 	channels []*generated.Channel
 	nodes    []*generated.NodeInfo
 
-	// UI components
-	viewport  viewport.Model
-	textInput textinput.Model
+	// Widgets
+	statusBar *widgets.Paragraph
+	sidebar   *widgets.Paragraph
+	msgView   *widgets.Paragraph
+	inputBox  *widgets.Paragraph
+	helpBar   *widgets.Paragraph
+
+	// Text input state
+	inputBuf    []rune
+	inputCursor int
+
+	// Message display state
+	msgLines  []string
+	msgScroll int // offset from bottom (0 = latest messages visible)
 
 	connStatus string
 }
 
-// New creates a Model wired to the given connected Client.
-func New(client *transport.Client) Model {
-	ti := textinput.New()
-	ti.Placeholder = "Type a message…"
-	ti.Focus()
-	ti.CharLimit = 228 // Meshtastic max payload ~237 bytes; leave headroom
-
-	vp := viewport.New(defaultWidth-sidebarW, defaultHeight-statusBarH-inputAreaH-helpBarH)
-
+// New creates an App wired to the given connected Client.
+func New(client *transport.Client) *App {
 	ms := store.NewMessageStore()
 	ms.CreateSystemMessage("Welcome to Meshtastic Go!")
 
-	// Snapshot initial state — filter out disabled channels.
 	channels := filterActiveChannels(client.State.Channels())
 	nodes := client.State.Nodes()
 	sortNodes(nodes)
 
-	return Model{
+	return &App{
 		client:       client,
-		width:        defaultWidth,
-		height:       defaultHeight,
 		messageStore: ms,
 		mode:         viewChannel,
 		channels:     channels,
 		nodes:        nodes,
-		viewport:     vp,
-		textInput:    ti,
+		statusBar:    widgets.NewParagraph(),
+		sidebar:      widgets.NewParagraph(),
+		msgView:      widgets.NewParagraph(),
+		inputBox:     widgets.NewParagraph(),
+		helpBar:      widgets.NewParagraph(),
 		connStatus:   "Connected",
 	}
 }
 
-// Init returns the initial command — start listening for radio events.
-func (m Model) Init() tea.Cmd {
-	return m.listenForEvent()
-}
+// Run initialises termui and drives the event loop until quit.
+func (a *App) Run() error {
+	if err := tui.Init(); err != nil {
+		return fmt.Errorf("initialising terminal UI: %w", err)
+	}
+	defer tui.Close()
 
-// listenForEvent returns a tea.Cmd that blocks on client.Events and
-// wraps the next event as a radioEventMsg.
-func (m Model) listenForEvent() tea.Cmd {
-	return func() tea.Msg {
-		ev, ok := <-m.client.Events
-		if !ok {
-			// Channel closed — radio disconnected.
-			return radioEventMsg{event: transport.ConnectionEvent{
-				Status:  transport.StatusDisconnected,
-				Message: "Radio connection closed",
-			}}
+	a.initWidgets()
+	a.width, a.height = tui.TerminalDimensions()
+	a.layout()
+	a.refreshMessages()
+	a.draw()
+
+	uiEvents := tui.PollEvents()
+	radioEvents := a.client.Events // will be nil-ed after close
+
+	for {
+		select {
+		case e := <-uiEvents:
+			switch e.Type {
+			case tui.KeyboardEvent:
+				if a.handleKey(e.ID) {
+					return nil
+				}
+			case tui.ResizeEvent:
+				p := e.Payload.(tui.Resize)
+				a.width, a.height = p.Width, p.Height
+				a.layout()
+				a.refreshMessages()
+			case tui.MouseEvent:
+				a.handleMouse(e.ID)
+			}
+			a.draw()
+
+		case ev, ok := <-radioEvents:
+			if !ok {
+				radioEvents = nil // prevent busy-loop on closed channel
+				a.connStatus = "Disconnected"
+				a.messageStore.CreateSystemMessage("Radio connection lost")
+				a.refreshMessages()
+				a.draw()
+				continue
+			}
+			a.handleRadioEvent(ev)
+			a.refreshMessages()
+			a.draw()
 		}
-		return radioEventMsg{event: ev}
 	}
 }
 
-// ---------- Update ----------
+// ---------- Initialisation ----------
 
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var cmds []tea.Cmd
-
-	switch msg := msg.(type) {
-
-	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
-		m.viewport.Width = m.width - sidebarW
-		m.viewport.Height = m.height - statusBarH - inputAreaH - helpBarH
-		m.textInput.Width = m.width - sidebarW - 4
-		m.ready = true
-		m.refreshMessages()
-
-	case radioEventMsg:
-		m.handleRadioEvent(msg.event)
-		m.refreshMessages()
-		cmds = append(cmds, m.listenForEvent())
-
-	case tea.KeyMsg:
-		cmd := m.handleKey(msg)
-		if cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		// Only forward key events to the component that has focus.
-		if m.focus == focusInput {
-			var tiCmd tea.Cmd
-			m.textInput, tiCmd = m.textInput.Update(msg)
-			cmds = append(cmds, tiCmd)
-		}
-		// Viewport scrolls only when input is focused (not when sidebar navigates).
-		if m.focus == focusInput {
-			var vpCmd tea.Cmd
-			m.viewport, vpCmd = m.viewport.Update(msg)
-			cmds = append(cmds, vpCmd)
-		}
-		return m, tea.Batch(cmds...)
-
-	default:
-		// Non-key messages (window size, etc.) go to all components.
-		var tiCmd tea.Cmd
-		m.textInput, tiCmd = m.textInput.Update(msg)
-		cmds = append(cmds, tiCmd)
-		var vpCmd tea.Cmd
-		m.viewport, vpCmd = m.viewport.Update(msg)
-		cmds = append(cmds, vpCmd)
-	}
-
-	return m, tea.Batch(cmds...)
-}
-
-// handleRadioEvent processes a single RadioEvent and updates model state.
-func (m *Model) handleRadioEvent(ev transport.RadioEvent) {
-	switch e := ev.(type) {
-	case transport.TextMessageEvent:
-		m.messageStore.CreateIncomingMessage(
-			e.Content, e.From, e.SenderName, e.To, e.Channel, e.Timestamp,
-		)
-	case transport.NodeUpdateEvent:
-		m.nodes = m.client.State.Nodes()
-		sortNodes(m.nodes)
-	case transport.ConnectionEvent:
-		m.connStatus = e.Status.String()
-		if e.Message != "" {
-			m.messageStore.CreateSystemMessage(e.Message)
-		}
-	case transport.TelemetryEvent:
-		m.nodes = m.client.State.Nodes()
-		sortNodes(m.nodes)
-	case transport.PositionEvent:
-		m.nodes = m.client.State.Nodes()
-		sortNodes(m.nodes)
-	}
-}
-
-// handleKey processes a key press and returns an optional command.
-func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
-	// Global keys — work in any focus state.
-	switch {
-	case key.Matches(msg, keys.Quit):
-		return tea.Quit
-	case key.Matches(msg, keys.Tab):
-		m.toggleFocus()
-		return nil
-	case key.Matches(msg, keys.NextChan):
-		if len(m.channels) > 0 {
-			m.channelIdx = (m.channelIdx + 1) % len(m.channels)
-			m.mode = viewChannel
-			m.refreshMessages()
-		}
-		return nil
-	case key.Matches(msg, keys.PrevChan):
-		if len(m.channels) > 0 {
-			m.channelIdx = (m.channelIdx - 1 + len(m.channels)) % len(m.channels)
-			m.mode = viewChannel
-			m.refreshMessages()
-		}
-		return nil
-	}
-
-	// Focus-specific keys.
-	switch m.focus {
-	case focusSidebar:
-		return m.handleSidebarKey(msg)
-	case focusInput:
-		return m.handleInputKey(msg)
-	}
-	return nil
-}
-
-// handleSidebarKey handles keys when the sidebar has focus.
-func (m *Model) handleSidebarKey(msg tea.KeyMsg) tea.Cmd {
-	switch msg.Type {
-	case tea.KeyUp:
-		if m.sidebarCursor > 0 {
-			m.sidebarCursor--
-			m.ensureSidebarCursorVisible()
-		}
-	case tea.KeyDown:
-		max := m.sidebarListLen() - 1
-		if max < 0 {
-			max = 0
-		}
-		if m.sidebarCursor < max {
-			m.sidebarCursor++
-			m.ensureSidebarCursorVisible()
-		}
-	case tea.KeyLeft, tea.KeyRight:
-		// Switch between channels tab and nodes tab.
-		m.sidebarTab = (m.sidebarTab + 1) % 2
-		m.sidebarCursor = 0
-		m.sidebarOffset = 0
-	case tea.KeyEnter:
-		m.selectSidebarItem()
-	case tea.KeyEscape:
-		m.focus = focusInput
-		m.textInput.Focus()
-		m.mode = viewChannel
-		m.refreshMessages()
-	default:
-		// Any printable character → switch to input and let it be typed.
-		if msg.Type == tea.KeyRunes {
-			m.focus = focusInput
-			m.textInput.Focus()
-		}
-	}
-	return nil
-}
-
-// handleInputKey handles keys when the text input has focus.
-func (m *Model) handleInputKey(msg tea.KeyMsg) tea.Cmd {
-	switch {
-	case key.Matches(msg, keys.Send):
-		return m.sendMessage()
-	case key.Matches(msg, keys.Esc):
-		if m.mode == viewDM {
-			m.mode = viewChannel
-			m.refreshMessages()
-		}
-	}
-	return nil
-}
-
-// toggleFocus switches between sidebar and text input focus.
-func (m *Model) toggleFocus() {
-	if m.focus == focusInput {
-		m.focus = focusSidebar
-		m.textInput.Blur()
-	} else {
-		m.focus = focusInput
-		m.textInput.Focus()
-	}
-}
-
-// selectSidebarItem activates the currently highlighted sidebar item.
-func (m *Model) selectSidebarItem() {
-	if m.sidebarTab == 0 {
-		// Channels tab: switch active channel.
-		if m.sidebarCursor < len(m.channels) {
-			m.channelIdx = m.sidebarCursor
-			m.mode = viewChannel
-			m.refreshMessages()
-		}
-	} else {
-		// Nodes tab: start DM with selected node.
-		if m.sidebarCursor < len(m.nodes) {
-			m.dmTarget = m.nodes[m.sidebarCursor].Num
-			m.mode = viewDM
-			m.refreshMessages()
-		}
-	}
-	// Return focus to input after selection.
-	m.focus = focusInput
-	m.textInput.Focus()
-}
-
-// sendMessage sends the current text input content via the client.
-func (m *Model) sendMessage() tea.Cmd {
-	content := strings.TrimSpace(m.textInput.Value())
-	if content == "" {
-		return nil
-	}
-
-	var to uint32
-	var chIdx uint32
-	switch m.mode {
-	case viewChannel:
-		to = store.BroadcastAddr
-		chIdx = m.activeChannelIndex()
-	case viewDM:
-		to = m.dmTarget
-		chIdx = 0 // DMs go on primary channel
-	}
-
-	m.messageStore.CreateOutgoingMessage(
-		content, to, chIdx, m.client.MyNodeNum(), m.client.LocalNodeName(),
-	)
-
-	// Actually transmit over the radio.
-	if err := m.client.SendText(to, chIdx, content); err != nil {
-		m.messageStore.CreateSystemMessage(fmt.Sprintf("Send failed: %v", err))
-	}
-
-	m.textInput.SetValue("")
-	m.refreshMessages()
-	return nil
-}
-
-// ---------- View ----------
-
-func (m Model) View() string {
-	if !m.ready {
-		return "Connecting to Meshtastic device…"
-	}
-
-	// Status bar
-	targetLabel := m.targetLabel()
-	nodeCount := len(m.nodes)
-	statusText := fmt.Sprintf(" %s │ %s │ %s │ Nodes: %d ",
-		m.connStatus, m.client.LocalNodeName(), targetLabel, nodeCount)
-	statusBar := statusStyle.Width(m.width).Render(statusText)
+func (a *App) initWidgets() {
+	// Status bar — borderless, coloured background.
+	a.statusBar.Border = false
+	a.statusBar.TextStyle = tui.NewStyle(tui.ColorWhite, tui.Color(24))
 
 	// Sidebar
-	sidebar := m.renderSidebar()
+	a.sidebar.Title = " Channels "
+	a.sidebar.TitleStyle = tui.NewStyle(tui.Color(39), tui.ColorClear, tui.ModifierBold)
+	a.sidebar.BorderStyle = tui.NewStyle(tui.Color(240))
+	a.sidebar.WrapText = false
 
 	// Message viewport
-	mainPanel := m.viewport.View()
+	a.msgView.Title = " Messages "
+	a.msgView.TitleStyle = tui.NewStyle(tui.Color(39), tui.ColorClear, tui.ModifierBold)
+	a.msgView.BorderStyle = tui.NewStyle(tui.Color(240))
+	a.msgView.WrapText = false
 
-	// Input
-	inputBar := inputStyle.Width(m.width - sidebarW).Render(m.textInput.View())
+	// Text input
+	a.inputBox.BorderStyle = tui.NewStyle(tui.Color(39))
+	a.inputBox.WrapText = false
 
-	// Compose
-	rightCol := lipgloss.JoinVertical(lipgloss.Left, mainPanel, inputBar)
-	body := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, rightCol)
-
-	// Persistent help bar
-	helpBar := m.renderHelpBar()
-
-	return lipgloss.JoinVertical(lipgloss.Left, statusBar, body, helpBar)
+	// Help bar — borderless, coloured background.
+	a.helpBar.Border = false
+	a.helpBar.TextStyle = tui.NewStyle(tui.Color(252), tui.Color(238))
 }
 
-// ---------- Sidebar rendering ----------
-
-func (m Model) renderSidebar() string {
-	// Exact body height: everything between status bar and help bar.
-	bodyH := m.height - statusBarH - helpBarH
-	if bodyH < 3 {
-		bodyH = 3
+// layout repositions all widgets for the current terminal size.
+func (a *App) layout() {
+	w, h := a.width, a.height
+	if w < 40 {
+		w = 40
+	}
+	if h < 8 {
+		h = 8
 	}
 
-	// Content width = sidebar total width minus frame (borders + padding).
-	// Each line MUST fit within this to prevent wrapping.
-	contentW := sidebarW - sidebarStyle.GetHorizontalFrameSize()
-	if contentW < 10 {
-		contentW = 10
+	sw := sidebarW
+	if sw > w/2 {
+		sw = w / 2
+	}
+	a.sideW = sw
+
+	a.statusBar.SetRect(0, 0, w, statusH)
+	a.sidebar.SetRect(0, statusH, sw, h-helpH)
+	a.msgView.SetRect(sw, statusH, w, h-helpH-inputH)
+	a.inputBox.SetRect(sw, h-helpH-inputH, w, h-helpH)
+	a.helpBar.SetRect(0, h-helpH, w, h)
+}
+
+// ---------- Rendering ----------
+
+func (a *App) draw() {
+	tui.Clear()
+	a.renderStatusBar()
+	a.renderSidebar()
+	a.renderMsgView()
+	a.renderInput()
+	a.renderHelpBar()
+	tui.Render(a.statusBar, a.sidebar, a.msgView, a.inputBox, a.helpBar)
+}
+
+func (a *App) renderStatusBar() {
+	target := a.targetLabel()
+	nodeCount := len(a.nodes)
+	a.statusBar.Text = fmt.Sprintf(" %s │ %s │ %s │ Nodes: %d",
+		a.connStatus, a.client.LocalNodeName(), target, nodeCount)
+}
+
+func (a *App) renderSidebar() {
+	isFocused := a.focus == focusSidebar
+
+	// Title reflects current tab and available switch.
+	if a.sidebarTab == 0 {
+		if isFocused {
+			a.sidebar.Title = " Channels [←→ Nodes] "
+		} else {
+			a.sidebar.Title = " Channels "
+		}
+	} else {
+		if isFocused {
+			a.sidebar.Title = " Nodes [←→ Channels] "
+		} else {
+			a.sidebar.Title = " Nodes "
+		}
 	}
 
-	isSidebarFocused := m.focus == focusSidebar
+	// Highlight border when focused.
+	if isFocused {
+		a.sidebar.BorderStyle = tui.NewStyle(tui.Color(39))
+	} else {
+		a.sidebar.BorderStyle = tui.NewStyle(tui.Color(240))
+	}
 
-	// Build list of items.
-	type sidebarEntry struct {
+	// Build item list.
+	type entry struct {
 		text string
 		high bool
 	}
+	var items []entry
 
-	var header string
-	var items []sidebarEntry
-
-	if m.sidebarTab == 0 {
-		if isSidebarFocused {
-			header = "Channels [←→ Nodes]"
-		} else {
-			header = "Channels"
-		}
-		for i, ch := range m.channels {
+	if a.sidebarTab == 0 {
+		for i, ch := range a.channels {
 			name := channelDisplayName(ch)
-			active := i == m.channelIdx && m.mode == viewChannel
-			cursored := isSidebarFocused && i == m.sidebarCursor
+			active := i == a.channelIdx && a.mode == viewChannel
+			cursored := isFocused && i == a.sidebarCursor
 			prefix := "  "
 			if cursored {
 				prefix = "► "
 			} else if active {
 				prefix = "● "
 			}
-			items = append(items, sidebarEntry{prefix + name, cursored || active})
+			items = append(items, entry{prefix + name, cursored || active})
 		}
 	} else {
-		if isSidebarFocused {
-			header = "Nodes [←→ Channels]"
-		} else {
-			header = "Nodes"
-		}
-		for i, n := range m.nodes {
+		for i, n := range a.nodes {
 			name := nodeDisplayName(n)
-			cursored := isSidebarFocused && i == m.sidebarCursor
-			dmActive := m.mode == viewDM && n.Num == m.dmTarget
+			cursored := isFocused && i == a.sidebarCursor
+			dmActive := a.mode == viewDM && n.Num == a.dmTarget
 			prefix := "  "
 			if cursored {
 				prefix = "► "
 			} else if dmActive {
 				prefix = "● "
 			}
-			items = append(items, sidebarEntry{prefix + name, cursored || dmActive})
+			items = append(items, entry{prefix + name, cursored || dmActive})
 		}
 	}
 
-	// Build output as an exact slice of `bodyH` lines.
-	// Every line is truncated to contentW to prevent wrapping.
-	lines := make([]string, 0, bodyH)
-
-	// Line 0: title (truncated).
-	lines = append(lines, sidebarTitle.MaxWidth(contentW).Render(header))
-
-	// Remaining lines for items + scroll indicators.
-	itemSlots := bodyH - len(lines)
-	if itemSlots < 1 {
-		itemSlots = 1
-	}
-
+	// Scrollable window.
+	contentH := a.sidebarContentH()
 	total := len(items)
-	offset := m.sidebarOffset
+	offset := a.sidebarOffset
 
-	// Determine scroll indicators and item capacity.
 	hasAbove := offset > 0
-	hasBelow := offset+itemSlots < total
-	listCap := itemSlots
+	hasBelow := offset+contentH < total
+	listCap := contentH
 	if hasAbove {
 		listCap--
 	}
@@ -569,188 +302,473 @@ func (m Model) renderSidebar() string {
 		listCap = 1
 	}
 
-	// ▲ indicator.
-	if hasAbove {
-		lines = append(lines, sidebarScrollHint.MaxWidth(contentW).Render(fmt.Sprintf("  ▲ %d more", offset)))
+	contentW := a.sideW - 2 // minus borders
+	if contentW < 10 {
+		contentW = 10
 	}
 
-	// Visible items — each truncated to contentW.
+	var lines []string
+
+	if hasAbove {
+		lines = append(lines, fmt.Sprintf("[  ▲ %d more](fg:243)", offset))
+	}
+
 	end := offset + listCap
 	if end > total {
 		end = total
 	}
 	for i := offset; i < end; i++ {
 		e := items[i]
+		t := truncateStr(e.text, contentW)
 		if e.high {
-			lines = append(lines, sidebarItemActive.MaxWidth(contentW).Render(e.text))
+			lines = append(lines, fmt.Sprintf("[%s](fg:229,mod:bold)", t))
 		} else {
-			lines = append(lines, sidebarItem.MaxWidth(contentW).Render(e.text))
+			lines = append(lines, fmt.Sprintf("[%s](fg:white)", t))
 		}
 	}
 
-	// ▼ indicator.
 	if hasBelow {
 		remaining := total - end
-		lines = append(lines, sidebarScrollHint.MaxWidth(contentW).Render(fmt.Sprintf("  ▼ %d more", remaining)))
+		lines = append(lines, fmt.Sprintf("[  ▼ %d more](fg:243)", remaining))
 	}
 
-	// Pad to exactly bodyH lines so sidebar never overflows or underflows.
-	for len(lines) < bodyH {
-		lines = append(lines, "")
-	}
-	if len(lines) > bodyH {
-		lines = lines[:bodyH]
-	}
-
-	content := strings.Join(lines, "\n")
-	return sidebarStyle.Width(sidebarW).Render(content)
+	a.sidebar.Text = strings.Join(lines, "\n")
 }
 
-func (m Model) sidebarListLen() int {
-	if m.sidebarTab == 0 {
-		return len(m.channels)
+func (a *App) renderMsgView() {
+	// Dynamic title mirrors the active target.
+	switch a.mode {
+	case viewDM:
+		a.msgView.Title = fmt.Sprintf(" DM: %s ", a.client.NodeName(a.dmTarget))
+	default:
+		if len(a.channels) > 0 && a.channelIdx < len(a.channels) {
+			a.msgView.Title = fmt.Sprintf(" %s ", channelDisplayName(a.channels[a.channelIdx]))
+		} else {
+			a.msgView.Title = " Messages "
+		}
 	}
-	return len(m.nodes)
+
+	contentH := a.msgContentH()
+	total := len(a.msgLines)
+	if total == 0 {
+		a.msgView.Text = ""
+		return
+	}
+
+	endIdx := total - a.msgScroll
+	if endIdx > total {
+		endIdx = total
+	}
+	if endIdx < 0 {
+		endIdx = 0
+	}
+	startIdx := endIdx - contentH
+	if startIdx < 0 {
+		startIdx = 0
+	}
+
+	a.msgView.Text = strings.Join(a.msgLines[startIdx:endIdx], "\n")
 }
 
-// sidebarItemCapacity returns how many list items fit in the sidebar,
-// accounting for the title line. This is the raw capacity before
-// subtracting scroll indicator lines.
-func (m Model) sidebarItemCapacity() int {
-	bodyH := m.height - statusBarH - helpBarH
-	const titleLines = 1 // header only, no padding
-	v := bodyH - titleLines
-	if v < 1 {
-		v = 1
-	}
-	return v
-}
-
-// ensureSidebarCursorVisible adjusts sidebarOffset so the cursor is in view.
-func (m *Model) ensureSidebarCursorVisible() {
-	itemSlots := m.sidebarItemCapacity()
-	// Account for scroll indicators taking a line each.
-	if m.sidebarOffset > 0 {
-		itemSlots--
-	}
-	total := m.sidebarListLen()
-	if m.sidebarOffset+itemSlots < total {
-		itemSlots--
-	}
-	if itemSlots < 1 {
-		itemSlots = 1
-	}
-
-	// Scroll down if cursor is below the visible window.
-	if m.sidebarCursor >= m.sidebarOffset+itemSlots {
-		m.sidebarOffset = m.sidebarCursor - itemSlots + 1
-	}
-	// Scroll up if cursor is above the visible window.
-	if m.sidebarCursor < m.sidebarOffset {
-		m.sidebarOffset = m.sidebarCursor
-	}
-	if m.sidebarOffset < 0 {
-		m.sidebarOffset = 0
+func (a *App) renderInput() {
+	if a.focus == focusInput {
+		a.inputBox.BorderStyle = tui.NewStyle(tui.Color(39))
+		if len(a.inputBuf) == 0 {
+			a.inputBox.Text = "[█](fg:39)"
+		} else {
+			before := string(a.inputBuf[:a.inputCursor])
+			after := string(a.inputBuf[a.inputCursor:])
+			a.inputBox.Text = safeMarkup(before) + "[█](fg:39)" + safeMarkup(after)
+		}
+	} else {
+		a.inputBox.BorderStyle = tui.NewStyle(tui.Color(240))
+		if len(a.inputBuf) == 0 {
+			a.inputBox.Text = "[Type a message…](fg:243)"
+		} else {
+			a.inputBox.Text = safeMarkup(string(a.inputBuf))
+		}
 	}
 }
 
-// ---------- Help bar ----------
-
-// helpEntry is a key/description pair for the help bar.
-type helpEntry struct {
-	key  string
-	desc string
-}
-
-// renderHelpBar returns a styled, context-sensitive help bar.
-func (m Model) renderHelpBar() string {
-	var entries []helpEntry
-
-	switch m.focus {
+func (a *App) renderHelpBar() {
+	var parts []string
+	switch a.focus {
 	case focusInput:
-		entries = append(entries, helpEntry{"Tab", "sidebar"})
-		entries = append(entries, helpEntry{"Enter", "send"})
-		entries = append(entries, helpEntry{"Ctrl+N/P", "channels"})
-		if m.mode == viewDM {
-			entries = append(entries, helpEntry{"Esc", "back to channel"})
+		parts = append(parts, "[Tab](fg:229,mod:bold) sidebar")
+		parts = append(parts, "[Enter](fg:229,mod:bold) send")
+		parts = append(parts, "[Ctrl+N/P](fg:229,mod:bold) channels")
+		if a.mode == viewDM {
+			parts = append(parts, "[Esc](fg:229,mod:bold) back to channel")
 		}
 	case focusSidebar:
-		entries = append(entries, helpEntry{"↑↓", "navigate"})
-		if m.sidebarTab == 0 {
-			entries = append(entries, helpEntry{"←→", "nodes"})
-			entries = append(entries, helpEntry{"Enter", "switch channel"})
+		parts = append(parts, "[↑↓](fg:229,mod:bold) navigate")
+		if a.sidebarTab == 0 {
+			parts = append(parts, "[←→](fg:229,mod:bold) nodes")
+			parts = append(parts, "[Enter](fg:229,mod:bold) switch channel")
 		} else {
-			entries = append(entries, helpEntry{"←→", "channels"})
-			entries = append(entries, helpEntry{"Enter", "direct message"})
+			parts = append(parts, "[←→](fg:229,mod:bold) channels")
+			parts = append(parts, "[Enter](fg:229,mod:bold) direct message")
 		}
-		entries = append(entries, helpEntry{"Tab", "input"})
-		entries = append(entries, helpEntry{"Esc", "back"})
+		parts = append(parts, "[Tab](fg:229,mod:bold) input")
+		parts = append(parts, "[Esc](fg:229,mod:bold) back")
 	}
-	entries = append(entries, helpEntry{"Ctrl+C", "quit"})
+	parts = append(parts, "[Ctrl+C](fg:229,mod:bold) quit")
 
-	sep := helpSepStyle.Render(" │ ")
-	var parts []string
-	for _, e := range entries {
-		parts = append(parts, helpKeyStyle.Render(e.key)+" "+helpDescStyle.Render(e.desc))
-	}
-
-	line := " " + strings.Join(parts, sep) + " "
-	return helpBarStyle.Width(m.width).Render(line)
+	a.helpBar.Text = " " + strings.Join(parts, " [│](fg:243) ")
 }
 
-// ---------- Message rendering ----------
+// ---------- Event handling ----------
 
-// refreshMessages re-renders the viewport content based on the active view.
-func (m *Model) refreshMessages() {
-	var msgs []store.Message
-	switch m.mode {
-	case viewChannel:
-		msgs = m.messageStore.GetMessagesByChannel(m.activeChannelIndex())
-	case viewDM:
-		msgs = m.messageStore.GetMessagesByConversation(m.client.MyNodeNum(), m.dmTarget)
+// handleKey processes a keyboard event. Returns true to quit.
+func (a *App) handleKey(id string) bool {
+	// Global keys.
+	switch id {
+	case "<C-c>":
+		return true
+	case "<Tab>":
+		a.toggleFocus()
+		return false
+	case "<C-n>":
+		if len(a.channels) > 0 {
+			a.channelIdx = (a.channelIdx + 1) % len(a.channels)
+			a.mode = viewChannel
+			a.refreshMessages()
+		}
+		return false
+	case "<C-p>":
+		if len(a.channels) > 0 {
+			a.channelIdx = (a.channelIdx - 1 + len(a.channels)) % len(a.channels)
+			a.mode = viewChannel
+			a.refreshMessages()
+		}
+		return false
 	}
 
-	var lines []string
+	// Focus-specific keys.
+	switch a.focus {
+	case focusSidebar:
+		a.handleSidebarKey(id)
+	case focusInput:
+		a.handleInputKey(id)
+	}
+	return false
+}
+
+func (a *App) handleSidebarKey(id string) {
+	switch id {
+	case "<Up>":
+		if a.sidebarCursor > 0 {
+			a.sidebarCursor--
+			a.ensureSidebarVisible()
+		}
+	case "<Down>":
+		mx := a.sidebarListLen() - 1
+		if mx < 0 {
+			mx = 0
+		}
+		if a.sidebarCursor < mx {
+			a.sidebarCursor++
+			a.ensureSidebarVisible()
+		}
+	case "<Left>", "<Right>":
+		a.sidebarTab = (a.sidebarTab + 1) % 2
+		a.sidebarCursor = 0
+		a.sidebarOffset = 0
+	case "<Enter>":
+		a.selectSidebarItem()
+	case "<Escape>":
+		a.focus = focusInput
+		a.mode = viewChannel
+		a.refreshMessages()
+	default:
+		// Printable character → switch to input and type it.
+		if len(id) > 0 && id[0] != '<' {
+			a.focus = focusInput
+			a.handleInputKey(id)
+		}
+	}
+}
+
+func (a *App) handleInputKey(id string) {
+	switch id {
+	case "<Enter>":
+		a.sendMessage()
+	case "<Escape>":
+		if a.mode == viewDM {
+			a.mode = viewChannel
+			a.refreshMessages()
+		}
+	case "<Backspace>", "<C-h>":
+		if a.inputCursor > 0 {
+			a.inputBuf = append(a.inputBuf[:a.inputCursor-1], a.inputBuf[a.inputCursor:]...)
+			a.inputCursor--
+		}
+	case "<Delete>":
+		if a.inputCursor < len(a.inputBuf) {
+			a.inputBuf = append(a.inputBuf[:a.inputCursor], a.inputBuf[a.inputCursor+1:]...)
+		}
+	case "<Left>":
+		if a.inputCursor > 0 {
+			a.inputCursor--
+		}
+	case "<Right>":
+		if a.inputCursor < len(a.inputBuf) {
+			a.inputCursor++
+		}
+	case "<Home>", "<C-a>":
+		a.inputCursor = 0
+	case "<End>", "<C-e>":
+		a.inputCursor = len(a.inputBuf)
+	case "<C-u>":
+		a.inputBuf = a.inputBuf[:0]
+		a.inputCursor = 0
+	case "<C-k>":
+		a.inputBuf = a.inputBuf[:a.inputCursor]
+	case "<C-w>":
+		if a.inputCursor > 0 {
+			i := a.inputCursor - 1
+			for i > 0 && a.inputBuf[i] == ' ' {
+				i--
+			}
+			for i > 0 && a.inputBuf[i-1] != ' ' {
+				i--
+			}
+			a.inputBuf = append(a.inputBuf[:i], a.inputBuf[a.inputCursor:]...)
+			a.inputCursor = i
+		}
+	case "<Space>":
+		a.insertRune(' ')
+	case "<PageUp>":
+		a.scrollMessages(5)
+	case "<PageDown>":
+		a.scrollMessages(-5)
+	default:
+		// Regular character input (skip anything that looks like a special key).
+		if len(id) > 0 && id[0] != '<' {
+			for _, r := range id {
+				a.insertRune(r)
+			}
+		}
+	}
+}
+
+func (a *App) handleMouse(id string) {
+	switch id {
+	case "<MouseWheelUp>":
+		a.scrollMessages(3)
+		a.draw()
+	case "<MouseWheelDown>":
+		a.scrollMessages(-3)
+		a.draw()
+	}
+}
+
+func (a *App) handleRadioEvent(ev transport.RadioEvent) {
+	switch e := ev.(type) {
+	case transport.TextMessageEvent:
+		a.messageStore.CreateIncomingMessage(
+			e.Content, e.From, e.SenderName, e.To, e.Channel, e.Timestamp,
+		)
+	case transport.NodeUpdateEvent:
+		a.nodes = a.client.State.Nodes()
+		sortNodes(a.nodes)
+	case transport.ConnectionEvent:
+		a.connStatus = e.Status.String()
+		if e.Message != "" {
+			a.messageStore.CreateSystemMessage(e.Message)
+		}
+	case transport.TelemetryEvent:
+		a.nodes = a.client.State.Nodes()
+		sortNodes(a.nodes)
+	case transport.PositionEvent:
+		a.nodes = a.client.State.Nodes()
+		sortNodes(a.nodes)
+	}
+}
+
+// ---------- Actions ----------
+
+func (a *App) toggleFocus() {
+	if a.focus == focusInput {
+		a.focus = focusSidebar
+	} else {
+		a.focus = focusInput
+	}
+}
+
+func (a *App) selectSidebarItem() {
+	if a.sidebarTab == 0 {
+		if a.sidebarCursor < len(a.channels) {
+			a.channelIdx = a.sidebarCursor
+			a.mode = viewChannel
+			a.refreshMessages()
+		}
+	} else {
+		if a.sidebarCursor < len(a.nodes) {
+			a.dmTarget = a.nodes[a.sidebarCursor].Num
+			a.mode = viewDM
+			a.refreshMessages()
+		}
+	}
+	a.focus = focusInput
+}
+
+func (a *App) sendMessage() {
+	content := strings.TrimSpace(string(a.inputBuf))
+	if content == "" {
+		return
+	}
+
+	var to, chIdx uint32
+	switch a.mode {
+	case viewChannel:
+		to = store.BroadcastAddr
+		chIdx = a.activeChannelIndex()
+	case viewDM:
+		to = a.dmTarget
+		chIdx = 0
+	}
+
+	a.messageStore.CreateOutgoingMessage(
+		content, to, chIdx, a.client.MyNodeNum(), a.client.LocalNodeName(),
+	)
+	if err := a.client.SendText(to, chIdx, content); err != nil {
+		a.messageStore.CreateSystemMessage(fmt.Sprintf("Send failed: %v", err))
+	}
+
+	a.inputBuf = a.inputBuf[:0]
+	a.inputCursor = 0
+	a.refreshMessages()
+}
+
+func (a *App) insertRune(r rune) {
+	if len(a.inputBuf) >= maxInputLen {
+		return
+	}
+	newBuf := make([]rune, len(a.inputBuf)+1)
+	copy(newBuf, a.inputBuf[:a.inputCursor])
+	newBuf[a.inputCursor] = r
+	copy(newBuf[a.inputCursor+1:], a.inputBuf[a.inputCursor:])
+	a.inputBuf = newBuf
+	a.inputCursor++
+}
+
+// ---------- Messages ----------
+
+func (a *App) refreshMessages() {
+	var msgs []store.Message
+	switch a.mode {
+	case viewChannel:
+		msgs = a.messageStore.GetMessagesByChannel(a.activeChannelIndex())
+	case viewDM:
+		msgs = a.messageStore.GetMessagesByConversation(a.client.MyNodeNum(), a.dmTarget)
+	}
+
+	lines := make([]string, 0, len(msgs))
 	for _, msg := range msgs {
 		lines = append(lines, formatMessage(msg))
 	}
+	a.msgLines = lines
+	a.msgScroll = 0 // pin to latest
+}
 
-	m.viewport.SetContent(strings.Join(lines, "\n"))
-	m.viewport.GotoBottom()
+func (a *App) scrollMessages(delta int) {
+	a.msgScroll += delta
+	maxScroll := len(a.msgLines) - a.msgContentH()
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if a.msgScroll > maxScroll {
+		a.msgScroll = maxScroll
+	}
+	if a.msgScroll < 0 {
+		a.msgScroll = 0
+	}
 }
 
 func formatMessage(msg store.Message) string {
-	ts := timeStyle.Render(msg.Timestamp.Format("15:04:05"))
-	sender := nameStyle.Render(msg.SenderName)
+	ts := msg.Timestamp.Format("15:04:05")
+	sender := padRight(msg.SenderName, 16)
 
-	var body string
 	switch msg.Type {
-	case store.MessageTypeIncoming:
-		body = incomingStyle.Render(msg.Content)
-	case store.MessageTypeOutgoing:
-		body = outgoingStyle.Render(msg.Content)
 	case store.MessageTypeSystem:
-		return systemStyle.Render(fmt.Sprintf("%s  %s", ts, msg.Content))
+		return fmt.Sprintf("[%s  %s](fg:yellow)", ts, safeMarkup(msg.Content))
+	case store.MessageTypeIncoming:
+		return fmt.Sprintf("[%s](fg:white) [%s](fg:cyan,mod:bold) [%s](fg:green)",
+			ts, safeMarkup(sender), safeMarkup(msg.Content))
+	case store.MessageTypeOutgoing:
+		return fmt.Sprintf("[%s](fg:white) [%s](fg:cyan,mod:bold) [%s](fg:magenta)",
+			ts, safeMarkup(sender), safeMarkup(msg.Content))
+	default:
+		return fmt.Sprintf("[%s](fg:white) [%s](fg:cyan,mod:bold) [%s](fg:white)",
+			ts, safeMarkup(sender), safeMarkup(msg.Content))
 	}
-	return fmt.Sprintf("%s %s %s", ts, sender, body)
+}
+
+// ---------- Sidebar scrolling ----------
+
+func (a *App) sidebarListLen() int {
+	if a.sidebarTab == 0 {
+		return len(a.channels)
+	}
+	return len(a.nodes)
+}
+
+func (a *App) sidebarContentH() int {
+	h := a.height - statusH - helpH - 2 // border top/bottom
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
+func (a *App) msgContentH() int {
+	h := a.height - statusH - helpH - inputH - 2 // border top/bottom of msgView
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
+func (a *App) ensureSidebarVisible() {
+	cap := a.sidebarContentH()
+	if a.sidebarOffset > 0 {
+		cap--
+	}
+	total := a.sidebarListLen()
+	if a.sidebarOffset+cap < total {
+		cap--
+	}
+	if cap < 1 {
+		cap = 1
+	}
+	if a.sidebarCursor >= a.sidebarOffset+cap {
+		a.sidebarOffset = a.sidebarCursor - cap + 1
+	}
+	if a.sidebarCursor < a.sidebarOffset {
+		a.sidebarOffset = a.sidebarCursor
+	}
+	if a.sidebarOffset < 0 {
+		a.sidebarOffset = 0
+	}
 }
 
 // ---------- Helpers ----------
 
-func (m Model) activeChannelIndex() uint32 {
-	if m.channelIdx < 0 || m.channelIdx >= len(m.channels) {
+func (a *App) activeChannelIndex() uint32 {
+	if a.channelIdx < 0 || a.channelIdx >= len(a.channels) {
 		return 0
 	}
-	return uint32(m.channels[m.channelIdx].Index)
+	return uint32(a.channels[a.channelIdx].Index)
 }
 
-func (m Model) targetLabel() string {
-	switch m.mode {
+func (a *App) targetLabel() string {
+	switch a.mode {
 	case viewDM:
-		return "DM: " + m.client.NodeName(m.dmTarget)
+		return "DM: " + a.client.NodeName(a.dmTarget)
 	default:
-		if len(m.channels) > 0 && m.channelIdx < len(m.channels) {
-			return "Ch: " + channelDisplayName(m.channels[m.channelIdx])
+		if len(a.channels) > 0 && a.channelIdx < len(a.channels) {
+			return "Ch: " + channelDisplayName(a.channels[a.channelIdx])
 		}
 		return "Ch: Primary"
 	}
@@ -777,7 +795,6 @@ func nodeDisplayName(n *generated.NodeInfo) string {
 	return name
 }
 
-// filterActiveChannels removes DISABLED channels from the list.
 func filterActiveChannels(all []*generated.Channel) []*generated.Channel {
 	var out []*generated.Channel
 	for _, ch := range all {
@@ -788,14 +805,36 @@ func filterActiveChannels(all []*generated.Channel) []*generated.Channel {
 	return out
 }
 
-// sortNodes sorts nodes by last heard (most recent first), then by name A-Z.
 func sortNodes(nodes []*generated.NodeInfo) {
 	sort.Slice(nodes, func(i, j int) bool {
-		// Most recently heard first.
 		if nodes[i].LastHeard != nodes[j].LastHeard {
 			return nodes[i].LastHeard > nodes[j].LastHeard
 		}
-		// Tie-break: alphabetical by display name.
 		return nodeDisplayName(nodes[i]) < nodeDisplayName(nodes[j])
 	})
+}
+
+func truncateStr(s string, maxLen int) string {
+	runes := []rune(s)
+	if len(runes) > maxLen {
+		if maxLen > 1 {
+			return string(runes[:maxLen-1]) + "…"
+		}
+		return string(runes[:maxLen])
+	}
+	return s
+}
+
+func padRight(s string, width int) string {
+	runes := []rune(s)
+	if len(runes) >= width {
+		return string(runes[:width])
+	}
+	return s + strings.Repeat(" ", width-len(runes))
+}
+
+// safeMarkup prevents user content from being parsed as termui style markup
+// by breaking any accidental ](fg: patterns.
+func safeMarkup(s string) string {
+	return strings.ReplaceAll(s, "](", "] (")
 }

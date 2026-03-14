@@ -2,10 +2,10 @@ package serial
 
 import (
 	"fmt"
+	"log/slog"
 	"runtime"
 	"strings"
 
-	"github.com/charmbracelet/log"
 	"go.bug.st/serial"
 	"go.bug.st/serial/enumerator"
 )
@@ -17,33 +17,33 @@ const (
 
 // GetPorts returns a list of serial ports that are likely to be Meshtastic devices
 func GetPorts() []string {
-	log.Info("Searching for Meshtastic devices...")
+	slog.Info("Searching for Meshtastic devices...")
 
 	// Get a list of all available ports
 	ports, err := enumerator.GetDetailedPortsList()
 	if err != nil {
-		log.Error("Failed to get port list", "error", err)
+		slog.Error("Failed to get port list", "error", err)
 		return nil
 	}
 
 	if len(ports) == 0 {
-		log.Info("No serial ports found on system")
+		slog.Info("No serial ports found on system")
 		return nil
 	}
 
-	log.Info("Found serial ports", "count", len(ports))
+	slog.Info("Found serial ports", "count", len(ports))
 
 	// Print all discovered ports for debugging
 	for i, port := range ports {
 		if port.IsUSB {
-			log.Debug("Found USB device",
+			slog.Debug("Found USB device",
 				"index", i,
 				"name", port.Name,
 				"VID", port.VID,
 				"PID", port.PID,
 				"product", port.Product)
 		} else {
-			log.Debug("Found non-USB port",
+			slog.Debug("Found non-USB port",
 				"index", i,
 				"name", port.Name)
 		}
@@ -81,7 +81,7 @@ func GetPorts() []string {
 
 		// Then check USB devices by VID/PID
 		if port.IsUSB {
-			log.Debug("Checking USB device for VID/PID match", "port", portName, "VID", port.VID, "PID", port.PID)
+			slog.Debug("Checking USB device for VID/PID match", "port", portName, "VID", port.VID, "PID", port.PID)
 
 			// Check against knownDevices list
 			for _, device := range knownDevices {
@@ -95,17 +95,17 @@ func GetPorts() []string {
 
 		// Add the port if it matches any criteria
 		if isLikelyMeshtastic {
-			log.Info("Detected Meshtastic device", "port", portName, "reasons", strings.Join(reasons, ", "))
+			slog.Info("Detected Meshtastic device", "port", portName, "reasons", strings.Join(reasons, ", "))
 			meshtasticPorts = append(meshtasticPorts, portName)
 		} else {
-			log.Debug("Ignoring port", "port", portName, "reason", "no match for Meshtastic criteria")
+			slog.Debug("Ignoring port", "port", portName, "reason", "no match for Meshtastic criteria")
 		}
 	}
 
 	// If we found any devices, return them
 	if len(meshtasticPorts) > 0 {
-		log.Info("Found Meshtastic devices", "count", len(meshtasticPorts))
-		log.Debug("Detected ports", "ports", meshtasticPorts)
+		slog.Info("Found Meshtastic devices", "count", len(meshtasticPorts))
+		slog.Debug("Detected ports", "ports", meshtasticPorts)
 		return meshtasticPorts
 	}
 
@@ -113,7 +113,7 @@ func GetPorts() []string {
 	// This is a fallback for devices that don't match our known patterns
 	for _, port := range ports {
 		if strings.Contains(strings.ToLower(port.Name), "usb") {
-			log.Warn("No Meshtastic devices found, trying fallback detection", "port", port.Name)
+			slog.Warn("No Meshtastic devices found, trying fallback detection", "port", port.Name)
 			meshtasticPorts = append(meshtasticPorts, port.Name)
 		}
 	}
@@ -123,8 +123,8 @@ func GetPorts() []string {
 
 // Connect opens a connection to a serial port with the appropriate settings for Meshtastic
 func Connect(port string) (serial.Port, error) {
-	log.Info("Connecting to port", "port", port)
-	log.Debug("Opening connection to port", "port", port)
+	slog.Info("Connecting to port", "port", port)
+	slog.Debug("Opening connection to port", "port", port)
 	mode := &serial.Mode{
 		BaudRate: portSpeed,
 		DataBits: dataBits,
@@ -135,6 +135,6 @@ func Connect(port string) (serial.Port, error) {
 		return nil, fmt.Errorf("failed to open serial port %s: %w", port, err)
 	}
 
-	log.Info("Connected to port", "port", port)
+	slog.Info("Connected to port", "port", port)
 	return p, nil
 }
