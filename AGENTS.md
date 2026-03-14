@@ -4,7 +4,7 @@ This file provides guidance to WARP (warp.dev) when working with code in this re
 
 ## Project Overview
 
-A Go TUI application for interacting with Meshtastic LoRa mesh networking devices over serial connections. Built with Bubble Tea (charmbracelet) for the terminal UI and protobuf for the Meshtastic device protocol.
+A Go TUI application for interacting with Meshtastic LoRa mesh networking devices over serial connections. Built with termui (gizak/termui) for the terminal UI and protobuf for the Meshtastic device protocol.
 
 ## Build & Development Commands
 
@@ -52,7 +52,7 @@ internal/transport/  — Protocol framing (StreamConn), Client state machine, ev
     ↓
 internal/protocol/   — Protobuf message handling: routing FromRadio variants, sending ToRadio
     ↓
-internal/ui/         — Bubble Tea TUI model with sidebar (nodes), message viewport, text input
+internal/ui/         — termui TUI with sidebar (channels/nodes), message viewport, text input
     ↓
 pkg/generated/       — Auto-generated protobuf Go code (DO NOT edit manually)
 ```
@@ -76,7 +76,7 @@ pkg/generated/       — Auto-generated protobuf Go code (DO NOT edit manually)
 
 **Protocol layer** (`internal/protocol/`): `HandleMessageProto` is the central router — switches on `FromRadio` payload variant types and delegates to specialized handlers or dispatches events. `sender.go` constructs `ToRadio` messages for sending text.
 
-**UI** (`internal/ui/model.go`): Bubble Tea `Model` with three panels — node list sidebar, message viewport, and text input. Uses `internal/ui/store.MessageStore` for thread-safe message storage.
+**UI** (`internal/ui/model.go`): termui `App` with five Paragraph widgets — status bar, sidebar, message viewport, text input, and help bar. Uses a `select`-based event loop reading from both `tui.PollEvents()` and `Client.Events`. Uses `internal/ui/store.MessageStore` for thread-safe message storage.
 
 ### Protobuf / Generated Code
 

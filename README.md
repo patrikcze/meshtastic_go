@@ -2,7 +2,7 @@
 
 A terminal user interface (TUI) client for [Meshtastic](https://meshtastic.org/) LoRa mesh networking devices. Connect a Meshtastic radio via USB and chat on channels or send direct messages — all from your terminal.
 
-Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) and protobuf for the Meshtastic device protocol.
+Built with [termui](https://github.com/gizak/termui) and protobuf for the Meshtastic device protocol.
 
 ## Features
 
@@ -96,7 +96,7 @@ trunk check
 cmd/main.go              — Entry point: serial → transport → UI
 pkg/serial/              — USB device discovery and serial port connection
 internal/transport/      — Protocol framing (StreamConn), Client, typed events
-internal/ui/             — Bubble Tea TUI (model, view, key handling)
+internal/ui/             — termui TUI (event loop, widgets, key handling)
 internal/ui/store/       — Thread-safe message storage
 pkg/generated/           — Auto-generated protobuf Go code (do not edit)
 ```
@@ -112,4 +112,4 @@ This project is licensed under the MIT License — see the [LICENSE](LICENSE) fi
 ## Acknowledgments
 
 - [Meshtastic](https://meshtastic.org/) for the open-source mesh networking protocol
-- [Charm](https://charm.sh/) for Bubble Tea, Lip Gloss, and the terminal UI toolkit
+- [termui](https://github.com/gizak/termui) for the terminal dashboard UI library
