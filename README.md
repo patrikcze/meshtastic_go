@@ -6,7 +6,10 @@ Built with [termui](https://github.com/gizak/termui) and protobuf for the Meshta
 
 ## Features
 
-- **Plan add more features** - Some basic stuff only
+![TUI_EXAMPLE_1](./img/meshtastic_tui_1.png)
+![TUI_EXAMPLE_2](./img/meshtastic_tui_2.png)
+
+- **Refactored to use TermUI** - Used warp to refactor to use TermUI instead of Bubbletea.
 
 - **Channel messaging** — send and receive on any configured channel
 - **Direct messages** — DM any node in the mesh
