@@ -1,70 +1,76 @@
-// Description: Main entry point for the Meshtastic Go CLI application.
+// Description: Main entry point for the Meshtastic Go TUI application.
 package main
 
 import (
-	"crypto/rand"
-	"encoding/binary"
-	"log"
-	"meshtastic_go/internal/protocol"
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/log"
+
 	"meshtastic_go/internal/transport"
-	"meshtastic_go/pkg/generated"
+	"meshtastic_go/internal/ui"
 	"meshtastic_go/pkg/serial"
 )
 
 func main() {
-	// Step 1: Detect available USB serial ports for known devices
+	// Logging goes to a file so it doesn't interfere with the TUI alt-screen.
+	logFile, err := os.OpenFile("meshtastic_go.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open log file: %v\n", err)
+		os.Exit(1)
+	}
+	defer logFile.Close()
+	log.SetOutput(logFile)
+	log.SetLevel(log.DebugLevel)
+	log.SetReportTimestamp(true)
+
+	log.Info("Starting Meshtastic Go TUI")
+
+	// 1. Discover devices.
 	ports := serial.GetPorts()
 	if len(ports) == 0 {
-		log.Fatalf("No suitable USB serial ports found!")
+		fmt.Fprintln(os.Stderr, "No Meshtastic USB devices found.")
+		os.Exit(1)
 	}
-
-	// Pick the first detected port for simplicity (can be expanded to handle multiple devices)
 	devPath := ports[0]
-	log.Printf("Using serial port: %s", devPath)
+	log.Info("Using serial port", "port", devPath, "all", strings.Join(ports, ", "))
 
-	// Step 2: Establish a connection using the Connect function
+	// 2. Open serial connection.
 	streamPort, err := serial.Connect(devPath)
 	if err != nil {
-		log.Fatalf("Failed to open serial connection: %v", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect: %v\n", err)
+		os.Exit(1)
 	}
-	defer streamPort.Close()
 
-	// Step 3: Create the StreamConn object for further protocol handling
+	// 3. Wrap in StreamConn and create Client.
 	streamConn := transport.NewRadioStreamConn(streamPort)
+	client := transport.NewClient(streamConn)
 
-	dispatcher := transport.NewEventDispatcher()
-	dispatcher.RegisterHandler("MeshPacketReceived", protocol.HandleMeshPacketReceived)
-	// Register new handler for ConfigCompleteId
-	//dispatcher.RegisterHandler("ConfigCompleteId", handleConfigCompletee)
-
-	// Initialize protocol state
-	state := &transport.State{}
-
-	// Step 4: Send configuration request
-	// Inside the main function
-	var configID uint32
-	if err := binary.Read(rand.Reader, binary.LittleEndian, &configID); err != nil {
-		log.Fatalf("failed to generate random config ID: %v", err)
+	// 4. Config handshake (blocks until complete or timeout).
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := client.Connect(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Device handshake failed: %v\n", err)
+		os.Exit(1)
 	}
-	err = protocol.SendConfigRequest(streamConn, configID)
-	if err != nil {
-		log.Printf("Failed to send config request: %v", err)
-	}
+	log.Info("Connected", "node", client.LocalNodeName())
 
-	// Step 5: Send a test text message
-	err = protocol.SendTextMessage(streamConn, 532783092, 1419948843, "Connected to Device over Serial from GO!", false)
-	if err != nil {
-		log.Fatalf("Failed to send text message: %v", err)
+	// 5. Build TUI and run.
+	model := ui.New(client)
+	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Step 6: Continuously read incoming messages from the radio device
-	for {
-		var msg generated.FromRadio
-		err := streamConn.Read(&msg)
-		if err != nil {
-			log.Printf("Error reading from stream: %v", err)
-			continue
-		}
-		protocol.HandleMessageProto(&msg, dispatcher, state)
+	// 6. Cleanup.
+	if err := client.Close(); err != nil {
+		log.Warn("Error closing connection", "err", err)
 	}
+	log.Info("Exited cleanly")
 }
