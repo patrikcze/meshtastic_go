@@ -2,17 +2,22 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/log"
 
+	"meshtastic_go/internal/protocol"
+	"meshtastic_go/internal/transport"
 	"meshtastic_go/internal/ui"
+	"meshtastic_go/pkg/generated"
 	"meshtastic_go/pkg/serial"
 )
 
@@ -21,82 +26,151 @@ func main() {
 	log.SetLevel(log.DebugLevel)
 	log.SetReportTimestamp(true)
 	log.SetReportCaller(false)
-	// Create a file for logging
-	logFile, err := os.OpenFile("meshtastic_go.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	if err == nil {
-		log.SetOutput(logFile)
-		defer logFile.Close()
-	} else {
-		log.Warn("Failed to open log file, using stderr", "error", err)
-	}
 
 	log.Info("Starting Meshtastic Go TUI application")
 
 	// 2. Search for devices
 	log.Info("Searching for Meshtastic devices...")
 	ports := serial.GetPorts()
-	// Log detected devices
-	if len(ports) > 0 {
-		log.Info("Detected Meshtastic devices", "count", len(ports), "ports", strings.Join(ports, ", "))
-	} else {
-		log.Error("No Meshtastic devices detected")
-		fmt.Println("No Meshtastic devices detected. Please connect a device and try again.")
+	if len(ports) == 0 {
+		log.Fatalf("No suitable USB serial ports found!")
+	}
+	log.Info("Detected Meshtastic devices", "count", len(ports), "ports", strings.Join(ports, ", "))
+
+	// Pick the first detected port for simplicity
+	devPath := ports[0]
+	log.Printf("Using serial port: %s", devPath)
+
+	// 3. Establish a connection using the Connect function
+	streamPort, err := serial.Connect(devPath)
+	if err != nil {
+		log.Fatalf("Failed to open serial connection: %v", err)
+	}
+	log.Info("Serial port opened successfully")
+
+	// 4. Create the StreamConn object for further protocol handling
+	streamConn := transport.NewRadioStreamConn(streamPort)
+	if streamConn == nil {
+		log.Fatalf("Failed to initialize stream connection")
+	}
+	log.Info("Stream connection initialized successfully")
+
+	// Initialize the Meshtastic client
+	client := transport.NewClient(streamConn, false)
+	if client == nil {
+		log.Fatalf("Failed to initialize Meshtastic client")
+	}
+	device := serial.NewDevice(client)
+
+	// Initialize the event dispatcher
+	dispatcher := transport.NewEventDispatcher()
+	dispatcher.RegisterHandler("MeshPacketReceived", protocol.HandleMeshPacketReceived)
+
+	// 5. Connect to the device
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := device.Connect(ctx); err != nil {
+		log.Error("Failed to connect to Meshtastic device", "error", err)
 		os.Exit(1)
 	}
-	// Set up signal handling for graceful shutdown
+	log.Info("Connected to Meshtastic device successfully")
+
+	// 6. Fetch nodes and channels
+	log.Info("Fetching nodes from the device")
+	nodes, err := device.GetNodes()
+	if err != nil {
+		log.Error("Failed to retrieve nodes", "error", err)
+		os.Exit(1)
+	}
+	if nodes == nil {
+		log.Warn("No nodes retrieved from the device")
+		nodes = []serial.Node{}
+	}
+	log.Info("Fetching channels from the device")
+	channels, err := device.GetChannels()
+	if err != nil {
+		log.Error("Failed to retrieve channels", "error", err)
+		os.Exit(1)
+	}
+
+	// Convert nodes and channels to string slices for the TUI
+	nodeNames := make([]string, len(nodes))
+	for i, node := range nodes {
+		nodeNames[i] = node.Name
+	}
+	channelNames := make([]string, len(channels))
+	for i, channel := range channels {
+		channelNames[i] = channel.Name
+	}
+
+	// 7. Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	// Create a channel to signal program completion
+
+	var wg sync.WaitGroup
 	done := make(chan struct{})
 
-	// 4. Create and run the TUI
-	// Initialize our TUI model
+	// 8. Create and run the TUI
 	model := ui.New()
+	model.UpdateNodes(nodeNames)
+	model.UpdateChannels(channelNames)
 
-	// Create the bubble tea program
 	p := tea.NewProgram(
 		model,
-		tea.WithAltScreen(),       // Use the alternate screen buffer
-		tea.WithMouseCellMotion(), // Enable mouse support
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
 	)
 
-	// Handle signals in a separate goroutine
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		sig := <-sigChan
 		log.Info("Received signal, initiating graceful shutdown", "signal", sig)
-		// Request the program to exit gracefully
 		p.Send(tea.Quit())
-		// If the program doesn't exit in 5 seconds, force exit
 		select {
 		case <-done:
-			// Normal exit, do nothing
 		case <-time.After(5 * time.Second):
 			log.Warn("Forced exit after timeout")
 			os.Exit(1)
 		}
 	}()
 
-	// Run the TUI
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(done)
+		state := &transport.State{}
+		for {
+			var msg generated.FromRadio
+			err := streamConn.Read(&msg)
+			if err != nil {
+				log.Warn("Error reading from stream", "error", err)
+				if strings.Contains(err.Error(), "Port has been closed") {
+					return
+				}
+				continue
+			}
+			protocol.HandleMessageProto(&msg, dispatcher, state)
+		}
+	}()
+
 	log.Info("Starting TUI")
 	exitMsg, err := p.Run()
 	if err != nil {
-		log.Error("Error running program", "error", err)
-		fmt.Printf("Error running Meshtastic Go: %v\n", err)
+		log.Error("Error running TUI", "error", err)
 		os.Exit(1)
 	}
-	// Log exit message if available
 	if exitMsg != nil {
 		log.Info("Program exited", "message", fmt.Sprintf("%v", exitMsg))
 	} else {
 		log.Info("Program exited")
 	}
 
-	// 5. Handle cleanup on exit
-	// Signal that we're done
-	close(done)
+	// Wait for all goroutines to finish
+	wg.Wait()
 
-	// Allow time for any cleanup operations (like closing connections)
+	// Allow time for cleanup
 	log.Info("Performing cleanup...")
-	time.Sleep(500 * time.Millisecond) // Give a moment for cleanup
+	time.Sleep(500 * time.Millisecond)
 	log.Info("Meshtastic Go exited cleanly")
 }
