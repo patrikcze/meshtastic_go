@@ -323,7 +323,7 @@ func (a *App) renderSidebar() {
 		if e.high {
 			lines = append(lines, fmt.Sprintf("[%s](fg:229,mod:bold)", t))
 		} else {
-			lines = append(lines, fmt.Sprintf("[%s](fg:252)", t))
+			lines = append(lines, fmt.Sprintf("[%s](fg:white)", t))
 		}
 	}
 
@@ -692,15 +692,15 @@ func formatMessage(msg store.Message) string {
 
 	switch msg.Type {
 	case store.MessageTypeSystem:
-		return fmt.Sprintf("[%s  %s](fg:243)", ts, safeMarkup(msg.Content))
+		return fmt.Sprintf("[%s  %s](fg:yellow)", ts, safeMarkup(msg.Content))
 	case store.MessageTypeIncoming:
-		return fmt.Sprintf("[%s](fg:241) [%s](fg:39,mod:bold) [%s](fg:99)",
+		return fmt.Sprintf("[%s](fg:white) [%s](fg:cyan,mod:bold) [%s](fg:green)",
 			ts, safeMarkup(sender), safeMarkup(msg.Content))
 	case store.MessageTypeOutgoing:
-		return fmt.Sprintf("[%s](fg:241) [%s](fg:39,mod:bold) [%s](fg:170)",
+		return fmt.Sprintf("[%s](fg:white) [%s](fg:cyan,mod:bold) [%s](fg:magenta)",
 			ts, safeMarkup(sender), safeMarkup(msg.Content))
 	default:
-		return fmt.Sprintf("[%s](fg:241) [%s](fg:39,mod:bold) %s",
+		return fmt.Sprintf("[%s](fg:white) [%s](fg:cyan,mod:bold) [%s](fg:white)",
 			ts, safeMarkup(sender), safeMarkup(msg.Content))
 	}
 }
