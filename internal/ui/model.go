@@ -221,7 +221,7 @@ func (a *App) renderStatusBar() {
 	target := a.targetLabel()
 	nodeCount := len(a.nodes)
 	a.statusBar.Text = fmt.Sprintf(" %s │ %s │ %s │ Nodes: %d",
-		a.connStatus, a.client.LocalNodeName(), target, nodeCount)
+		safeMarkup(a.connStatus), safeMarkup(a.client.LocalNodeName()), safeMarkup(target), nodeCount)
 }
 
 func (a *App) renderSidebar() {
@@ -319,7 +319,7 @@ func (a *App) renderSidebar() {
 	}
 	for i := offset; i < end; i++ {
 		e := items[i]
-		t := truncateStr(e.text, contentW)
+		t := safeMarkup(truncateStr(e.text, contentW))
 		if e.high {
 			lines = append(lines, fmt.Sprintf("[%s](fg:229,mod:bold)", t))
 		} else {
@@ -339,10 +339,10 @@ func (a *App) renderMsgView() {
 	// Dynamic title mirrors the active target.
 	switch a.mode {
 	case viewDM:
-		a.msgView.Title = fmt.Sprintf(" DM: %s ", a.client.NodeName(a.dmTarget))
+		a.msgView.Title = fmt.Sprintf(" DM: %s ", safeMarkup(a.client.NodeName(a.dmTarget)))
 	default:
 		if len(a.channels) > 0 && a.channelIdx < len(a.channels) {
-			a.msgView.Title = fmt.Sprintf(" %s ", channelDisplayName(a.channels[a.channelIdx]))
+			a.msgView.Title = fmt.Sprintf(" %s ", safeMarkup(channelDisplayName(a.channels[a.channelIdx])))
 		} else {
 			a.msgView.Title = " Messages "
 		}

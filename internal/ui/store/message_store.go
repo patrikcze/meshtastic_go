@@ -209,4 +209,3 @@ func randomHex(n int) string {
 func FormatNodeID(nodeID uint32) string {
 	return fmt.Sprintf("!%08x", nodeID)
 }
-

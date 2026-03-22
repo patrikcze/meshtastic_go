@@ -4,18 +4,36 @@ BUILD_DIR=bin
 TARGETS=windows/amd64 linux/amd64 linux/arm darwin/arm64
 APP_NAME=meshtastic_go
 VERSION=$(shell git describe --tags --always)
+GO_FILES=$(shell find . -name '*.go' -not -path './vendor/*' -not -path './.git/*')
+FMT_FILES=$(shell find . -name '*.go' -not -path './vendor/*' -not -path './.git/*' -not -path './pkg/generated/*')
 
 # Default target
 .PHONY: all
-all: lint build
+all: test lint build
+
+# Test target
+.PHONY: test
+test:
+	@echo "Running tests..."
+	@$(GO) test ./...
+	@echo "Tests completed."
 
 # Linting target
 .PHONY: lint
 lint:
 	@echo "Running linters..."
-	@golint ./...
-	@gosec ./...
-	@go vet ./...
+	@if command -v trunk >/dev/null 2>&1; then \
+		trunk check; \
+	else \
+		echo "trunk not found; running gofmt and go vet fallback"; \
+		unformatted="$$(gofmt -l $(FMT_FILES))"; \
+		if [ -n "$$unformatted" ]; then \
+			echo "$$unformatted"; \
+			echo "gofmt reported unformatted files"; \
+			exit 1; \
+		fi; \
+		$(GO) vet ./...; \
+	fi
 	@echo "Linting completed."
 
 # Build target
