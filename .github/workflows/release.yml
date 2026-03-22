@@ -6,10 +6,38 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run vet
+        run: go vet ./...
+
   build:
+    needs: verify
+    permissions:
+      contents: read
+
     strategy:
       fail-fast: false
       matrix:
@@ -68,6 +96,8 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Download all artifacts
@@ -80,6 +110,11 @@ jobs:
           mkdir -p release
           find artifacts -type f -exec cp {} release/ \;
           ls -lh release/
+
+      - name: Generate checksums
+        run: |
+          cd release
+          shasum -a 256 * > SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
